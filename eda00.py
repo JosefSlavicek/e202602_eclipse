@@ -528,6 +528,7 @@ def discrepancy_batched_fourier3(
             (warped[i], moon_centers_warped[i], moon_radius_warped)
         )
     list_of_all_processed = []
+    antiprotuberance_threshold = None
     for img, moon_center, moon_radius in list_of_all:
         radius_max = min(
             moon_center[0],
@@ -539,6 +540,12 @@ def discrepancy_batched_fourier3(
         polar_img, _ = image_to_polars(
             img, moon_center, moon_radius, radius_max
         )
+        if antiprotuberance_threshold is None:
+            maxidx = polar_img.sum(dim=1).argmax()
+            maxrow = polar_img[maxidx, :]
+            maxrow = maxrow[maxrow > 0]
+            antiprotuberance_threshold = maxrow.quantile(0.9)
+        polar_img[polar_img > antiprotuberance_threshold] = antiprotuberance_threshold
         polar_img = fill_bottom(polar_img, 4)
         polar_img = remove_lowfeq(polar_img, 16)
         img = polar_to_cartesian(
@@ -914,7 +921,7 @@ def main():
                 f"  Check 2: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}"
             )
 
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "eda00_output.pkl"
+    out_path = sys.argv[1] if len(sys.argv) > 1 else "eda00_output2.pkl"
     with open(out_path, "wb") as fd:
         pickle.dump(exposure_groups, fd)
         pickle.dump(reg, fd)
