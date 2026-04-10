@@ -753,22 +753,25 @@ def stage0_detect_moons(image_infos: list) -> None:
         ii.moon_info_origin = MoonInfoOrigin.DIRECT
 
 
+def stage0_print_exposure_groups_stats(exposure_groups: dict) -> None:
+    for exposure_time in sorted(exposure_groups.keys()):
+        group = exposure_groups[exposure_time]
+        radii = [ii.moon[2] for ii in group if ii.moon is not None]
+        print(
+            f"exposure_time={exposure_time:.5f} len(group)={len(group)} "
+            f"np.mean(radii)={np.mean(radii):.2f} np.std(radii)={np.std(radii):.2f}"
+        )
+
+
 def stage0_group_by_exposure(image_infos: list) -> dict:
     """Build exposure_time -> [ImageInfo, ...] and print per-group radius stats."""
     exposure_groups = collections.defaultdict(list)
     for ii in image_infos:
         exposure_groups[ii.exposure_time].append(ii)
-    for exposure_time in sorted(exposure_groups.keys()):
-        group = exposure_groups[exposure_time]
-        radii = [ii.moon[2] for ii in group]
-        print(
-            f"exposure_time={exposure_time:.5f} len(group)={len(group)} "
-            f"np.mean(radii)={np.mean(radii):.2f} np.std(radii)={np.std(radii):.2f}"
-        )
     return exposure_groups
 
 
-def stage0_prune_radius_outliers(exposure_groups: dict) -> None:
+def stage0_prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
     """Drop moons that disagree with rolling reference radius (in-place)."""
     RADIUS_STD_THRESHOLD = 1.0
     MIN_GROUP_ELMS = 3
