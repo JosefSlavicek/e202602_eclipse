@@ -903,6 +903,7 @@ def stage0_register_intra_exposure_pairs(exposure_groups: dict) -> dict:
             key = (exposure_time, i, j)
             shift_i, shift_j, rotation = register_equal_exposure(group[i], group[j])
             reg[key] = (shift_i, shift_j, rotation)
+        # registration done, now just compute some debuging statistics
         res_i, res_j, res_rot = [], [], []
         for a, b in itertools.combinations(range(n), 2):
             rab = reg[(exposure_time, a, b)]
