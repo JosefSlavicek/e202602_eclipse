@@ -29,6 +29,66 @@ def v0_package_root() -> Path:
     )
 
 
+def plot_exposure_group_thumbnails(
+    exposure_groups: dict,
+    *,
+    max_side_px: int = 256,
+    ncols: int = 5,
+) -> None:
+    """One sample image per exposure (sorted by exposure time), max side ``max_side_px`` px."""
+    import math
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from PIL import Image
+
+    times = sorted(exposure_groups.keys())
+    if not times:
+        return
+
+    def _sample_image_path(group: list) -> Path:
+        return min(group, key=lambda ii: str(ii.path)).path
+
+    n = len(times)
+    nrows = math.ceil(n / ncols)
+    fig_w = 1.75 * ncols
+    # Row height tuned for title + landscape thumbnail; ``aspect="auto"`` avoids
+    # letterboxing from default ``equal`` that blew out vertical gaps between rows.
+    fig_h = 1.22 * nrows
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(fig_w, fig_h),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    for idx, t in enumerate(times):
+        r, c = divmod(idx, ncols)
+        ax = axes[r][c]
+        path = _sample_image_path(exposure_groups[t])
+        with Image.open(path) as im:
+            im = im.copy()
+        w, h = im.size
+        m = max(w, h)
+        if m > max_side_px:
+            s = max_side_px / m
+            im = im.resize((max(1, int(w * s)), max(1, int(h * s))), Image.Resampling.LANCZOS)
+        arr = np.asarray(im)
+        if arr.ndim == 2:
+            ax.imshow(arr, cmap="gray", aspect="auto")
+        else:
+            ax.imshow(arr, aspect="auto")
+        ax.set_title(f"{t:g} s", fontsize=10)
+        ax.axis("off")
+
+    for j in range(n, nrows * ncols):
+        r, c = divmod(j, ncols)
+        axes[r][c].axis("off")
+
+    plt.show()
+
+
 def main() -> None:
     V0_ROOT = v0_package_root()
     if str(V0_ROOT) not in sys.path:
