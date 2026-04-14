@@ -960,7 +960,7 @@ def run_stage0(data_root: str | Path, out_path: str | Path) -> Path:
     image_infos = get_image_infos(data_root)
     stage0_detect_moons(image_infos)
     exposure_groups = stage0_group_by_exposure(image_infos)
-    stage0_prune_radius_outliers(exposure_groups)
+    stage0_prune_moon_info_for_radius_outliers(exposure_groups)
     interp = stage0_interpolate_missing_moons(image_infos, exposure_groups)
     stage0_set_moon_position_std(image_infos, exposure_groups, interp)
     reg = stage0_register_intra_exposure_pairs(exposure_groups)
