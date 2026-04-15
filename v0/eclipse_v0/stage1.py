@@ -62,7 +62,7 @@ def prune_brightness_outliers(exposure_groups, reg, std_reduction_factor=3.0):
                 reg[(exp_key, i_new, j_new)] = v
             print(
                 f"prune_brightness_outliers: exp={exp_key:.5f} removed image (idx {k}) {removed_ii.path.name} "
-                f"brightness={removed_ii.avg_brightness:.6f} group_std {std_b:.6f} -> {new_std:.6f}"
+                f"brightness={removed_ii.avg_brightness:.6f} group_std change when removed: {std_b:.6f} -> {new_std:.6f}"
             )
 
 
