@@ -64,21 +64,21 @@ def unlock_and_burst():
     try:
         set_config('controlmode', '0')
 
-        do_burst('0.0015s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', True)
+        do_burst('0.0020s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', True)
+        do_burst('0.0015s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'no_repeat', False)
         do_burst('0.0769s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'double_in_two_runs', False)
         do_burst('0.0012s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)
         do_burst('0.1250s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'double_in_two_runs', False)
 
-        do_burst('0.0015s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'no_repeat', False)
         do_burst('0.1000s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'double_in_two_runs', False)
-        do_burst('0.0020s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)
         do_burst('0.1250s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'double_in_two_runs', False)
 
         do_burst('0.0769s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'double_in_two_runs', False)
         do_burst('0.1250s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'no_repeat', False)
 
-        do_burst('0.1000s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'no_repeat', False)
         do_burst('0.0012s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)
+        do_burst('0.1000s',   '1 EV', '7 images (normal, 3 unders and 3 overs)', 'no_repeat', False)
+        do_burst('0.0015s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)
         do_burst('0.0020s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'no_repeat', False)
 
         print(f"Done. Check the card. {time.time()-t0[0]:.2f} s")
