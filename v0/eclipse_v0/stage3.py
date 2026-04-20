@@ -780,27 +780,6 @@ def stage3_crop_and_save_composite(ctx: Stage3Context) -> None:
     )
     print(f"Saved {out_dir / 'v0-eda05_composite.npy'} (float64), {out_dir / 'v0-eda05_composite_preview.png'}")
 
-    if False:
-        lv_max = composite_crop.max()
-        for i in range(10):
-            preview = np.clip(composite_crop / lv_max, 0, 1)
-            Image.fromarray((preview * 255).clip(0, 255).astype(np.uint8)).save(
-                out_dir / f"v0-eda05_composite_preview_{i}.png"
-            )
-            lv_max /= 2
-        raise
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-    ax.imshow(
-        composite_crop,
-        cmap="gray",
-        vmin=0,
-        vmax=np.percentile(composite_crop[composite_crop > 0], 99) if np.any(composite_crop > 0) else 1,
-    )
-    ax.set_title("eda05 composite (ref frame, weighted merge, moon black)")
-    plt.tight_layout()
-    plt.close(fig)
-
     ctx.composite_crop = composite_crop
     ctx.mi_crop = float(mi_crop)
     ctx.mj_crop = float(mj_crop)
