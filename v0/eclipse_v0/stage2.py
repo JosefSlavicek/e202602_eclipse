@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import html
 import math
 import pickle
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 import tqdm
+from IPython.display import HTML, display
 from PIL import Image
 
 import eclipse_v0.stage0  # noqa: F401
@@ -20,6 +23,10 @@ from eclipse_v0.stage0 import (
     polar_to_cartesian,
     remove_lowfeq,
     transform_moon_center_batched,
+)
+
+_EDA03_PAIR_STRICT = re.compile(
+    r'^v0-eda03_pair_(\d+\.\d+)_(\d+\.\d+)_gamma(\d+\.\d+)\.gif$'
 )
 
 
@@ -396,6 +403,68 @@ def stage2_save_pickle(out_pkl: Path, pairs_results: list) -> Path:
         pickle.dump(gamma_by_pair, fd)
     print(f"Saved {out_pkl} (cross_reg, gamma_by_pair).")
     return out_pkl
+
+
+def _rel_href_for_notebook(p: Path) -> str:
+    rel = p.relative_to(Path.cwd()) if p.is_absolute() else p
+    s = rel.as_posix()
+    if not s.startswith(("./", "/")):
+        s = "./" + s
+    return s
+
+
+def symlink_eda03_pair_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:
+    workdir = Path(workdir)
+    link_dir = Path.cwd() if link_dir is None else Path(link_dir)
+    link_dir.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    for src in sorted(workdir.glob("v0-eda03_pair*.gif"), key=lambda p: p.name):
+        if not _EDA03_PAIR_STRICT.match(src.name):
+            continue
+        if not src.is_file():
+            continue
+        dst = link_dir / src.name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        dst.symlink_to(src.resolve())
+        created.append(dst)
+    return created
+
+
+def display_clickable_eda03_pair_gif_grid(
+    columns: int = 8, width: int = 128, gif_dir: Path | None = None
+) -> None:
+    gif_dir = Path.cwd() if gif_dir is None else Path(gif_dir)
+    chunk: list[tuple[Path, str]] = []
+    for p in sorted(gif_dir.glob("v0-eda03_pair*.gif"), key=lambda q: q.name):
+        m = _EDA03_PAIR_STRICT.match(p.name)
+        if not m:
+            continue
+        t0, t1, gamma = m.group(1), m.group(2), m.group(3)
+        chunk.append((p, f"t0={t0} t1={t1} \u03b3={gamma}"))
+    if not chunk:
+        display(HTML("<p><em>No strict-match v0-eda03_pair_*.gif files found.</em></p>"))
+        return
+    rows_html: list[str] = []
+    for i in range(0, len(chunk), columns):
+        row_cells: list[str] = []
+        for p, cap in chunk[i : i + columns]:
+            href = html.escape(_rel_href_for_notebook(p), quote=True)
+            cap_esc = html.escape(cap, quote=False)
+            row_cells.append(
+                "<td style=\"vertical-align:top; text-align:center; padding:6px;\">"
+                f'<a href="{href}" target="_blank">'
+                f'<img src="{href}" style="width:{int(width)}px; border:1px solid #ccc; border-radius:5px;">'
+                "</a>"
+                f'<p style="margin:4px 0 0 0;"><small>{cap_esc}</small></p>'
+                "</td>"
+            )
+        rows_html.append("<tr>" + "".join(row_cells) + "</tr>")
+    display(HTML(
+        '<table style="border-collapse:collapse;">'
+        + "".join(rows_html)
+        + "</table>"
+    ))
 
 
 def run_stage2(eda02_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
