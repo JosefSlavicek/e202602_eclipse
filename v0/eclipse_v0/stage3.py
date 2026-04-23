@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import html
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,7 @@ import torchvision
 import tqdm
 from PIL import Image
 from scipy.ndimage import gaussian_filter
+from IPython.display import HTML, display
 
 import eclipse_v0.stage0  # noqa: F401
 from eclipse_v0.stage0 import find_moon
@@ -786,6 +788,30 @@ def stage3_crop_and_save_composite(ctx: Stage3Context) -> None:
     ctx.moon_r = float(moon_r0)
 
 
+def _rel_href_for_notebook(p: Path) -> str:
+    rel = p.relative_to(Path.cwd()) if p.is_absolute() else p
+    s = rel.as_posix()
+    if not s.startswith(("./", "/")):
+        s = "./" + s
+    return s
+
+
+def symlink_and_display_clickable_composite(ctx: Stage3Context) -> list[Path]:
+    src = ctx.workdir / 'v0-eda05_composite_preview.png'
+    dst = Path.cwd() / 'v0-eda05_composite_preview.png'
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    dst.symlink_to(src.resolve())
+    href = html.escape(_rel_href_for_notebook(dst), quote=True)
+    display(
+        HTML(
+            f'<a href="{href}" target="_blank">'
+            f'<img src="{href}" style="width:256px; border:1px solid #ccc; border-radius:5px;">'
+            "</a>"
+        )
+    )
+
+
 def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
     """Refine moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1])."""
     assert ctx.composite_crop is not None
@@ -816,6 +842,8 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
     polar_img = polar_img.clone()
     valid = valid.clone()
 
+    # extrapolate data into the polar image pixels which are not covered by source image
+    # (we need this because we will do radial normalization)
     row_all = valid.bool().all(dim=1)
     if not bool(row_all.any().item()):
         raise AssertionError("polar extrapolation: no fully valid row")
@@ -853,6 +881,7 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
         row = sol[0, 0] * frow + sol[1, 0]
         polar_img[i, :][~m[i, :]] = row[~m[i, :]]
         valid_for_mean[i, :] = 1
+    # end of extrapolation magic
 
     display_ts = []
     mean_at_list = []
