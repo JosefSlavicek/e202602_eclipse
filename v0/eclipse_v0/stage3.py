@@ -76,9 +76,6 @@ class Stage3Context:
     H_crop: int = 0
     W_crop: int = 0
     display: Optional[np.ndarray] = None
-    row_fractions: list[float] = field(default_factory=list)
-    mean_at_list: list[Any] = field(default_factory=list)
-    p3_at: Any = None
     sharpened_fft_diff: Optional[np.ndarray] = None
     display_rgb: Optional[np.ndarray] = None
 
@@ -884,9 +881,7 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
     # end of extrapolation magic
 
     display_ts = []
-    mean_at_list = []
     row_fractions = [0.15, 1.0]
-    ctx.row_fractions = row_fractions
     for row_fraction in row_fractions:
         n_cols_use = max(1, int(n_theta * row_fraction))
         half_window = n_cols_use // 2
@@ -915,7 +910,6 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
         mean_at = _polar_to_cartesian_f64(
             mean_polar_2d, center, radius_min, radius_max, H_crop, W_crop, device, dtype
         )
-        mean_at_list.append(mean_at.cpu().numpy())
         valid_mask = torch.isfinite(mean_at) & (mean_at > 0)
         display_t = torch.zeros_like(img, device=device, dtype=dtype)
         v = img[valid_mask]
@@ -944,8 +938,6 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
     p3_polar_2d = p3_smooth.unsqueeze(1).expand(n_r, n_theta)
     p3_at = _polar_to_cartesian_f64(p3_polar_2d, center, radius_min, radius_max, H_crop, W_crop, device, dtype)
     p3_at = torch.nan_to_num(p3_at, nan=0.0)
-    ctx.p3_at = p3_at
-    ctx.mean_at_list = mean_at_list
 
     span = (1.0 - p3_at).clamp(min=1e-9)
     display_t = ((display_t - p3_at) / span).clamp(0.0, 1.0)
@@ -1046,19 +1038,6 @@ def stage3_rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     out_png = ctx.workdir / "v0-eda05_rgb_rescaled.png"
     Image.fromarray((display_rgb * 255).round().clip(0, 255).astype(np.uint8)).save(out_png)
     print(f"Saved {out_png}")
-
-    out_path = ctx.workdir / "v0-eda05_radial.pkl"
-    with open(out_path, "wb") as fd:
-        pickle.dump(
-            {
-                "row_fractions": ctx.row_fractions,
-                "mean_at_list": ctx.mean_at_list,
-                "p3_at": ctx.p3_at.cpu().numpy(),
-                "moon_mask": ctx.moon_mask,
-            },
-            fd,
-        )
-    print(f"Saved {out_path}")
 
 
 def run_stage3(workdir: Path) -> None:
