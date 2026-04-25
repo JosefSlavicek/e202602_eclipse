@@ -1,0 +1,4 @@
+gio mount -s gphoto2
+pkill -f gvfsd-gphoto2
+gphoto2 --get-all-files
+gphoto2 --delete-all-files --recurse
