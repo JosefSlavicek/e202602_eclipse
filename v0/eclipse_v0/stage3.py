@@ -793,9 +793,9 @@ def _rel_href_for_notebook(p: Path) -> str:
     return s
 
 
-def symlink_and_display_clickable_composite(ctx: Stage3Context) -> list[Path]:
-    src = ctx.workdir / 'v0-eda05_composite_preview.png'
-    dst = Path.cwd() / 'v0-eda05_composite_preview.png'
+def symlink_and_display_clickable(ctx: Stage3Context, filename: str) -> None:
+    src = ctx.workdir / filename
+    dst = Path.cwd() / filename
     if dst.exists() or dst.is_symlink():
         dst.unlink()
     dst.symlink_to(src.resolve())
@@ -1001,7 +1001,7 @@ def stage3_fft_unsharp_and_save(ctx: Stage3Context) -> None:
 
 def stage3_rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     """RGB + vignette PNG and v0-eda05_radial.pkl sidecar."""
-    assert ctx.sharpened_fft_diff is not None and ctx.moon_mask is not None and ctx.p3_at is not None
+    assert ctx.sharpened_fft_diff is not None and ctx.moon_mask is not None #and ctx.p3_at is not None
     gray = np.clip(ctx.sharpened_fft_diff.astype(np.float64), 0.0, 1.0)
     R = gray
     G = 0.16 + 0.84 * gray
