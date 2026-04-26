@@ -21,16 +21,7 @@ from PIL import Image
 from IPython.display import HTML, display
 import os
 
-from eclipse_v1.utils import load_grayscale, apply_transform_single, compute_weighted_average
-
-
-def compose_transforms(s1_i, s1_j, rot1_deg, s2_i, s2_j, rot2_deg):
-    """Compose transform (s1, rot1) then (s2, rot2). Returns (s_i, s_j, rot_deg)."""
-    theta1_rad = math.radians(rot1_deg)
-    cos1, sin1 = math.cos(theta1_rad), math.sin(theta1_rad)
-    s_rot_i = cos1 * s2_i - sin1 * s2_j
-    s_rot_j = sin1 * s2_i + cos1 * s2_j
-    return (s1_i + s_rot_i, s1_j + s_rot_j, rot1_deg + rot2_deg)
+from eclipse_v1.utils import load_grayscale, apply_transform_single, compute_weighted_average, compose_transforms
 
 
 def prune_brightness_outliers(exposure_groups, reg, std_reduction_factor=3.0):

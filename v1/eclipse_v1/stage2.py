@@ -15,15 +15,13 @@ from IPython.display import HTML, display
 from PIL import Image
 
 import eclipse_v1.stage0  # noqa: F401
-from eclipse_v1.stage0 import (
-    fill_bottom,
-    fill_moon,
-    gaussian_blur,
-    remove_lowfeq,
-    transform_moon_center_batched,
+from eclipse_v1.utils import (
+    load_grayscale,
+    apply_transform_single,
+    compute_weighted_average,
+    moon_median,
+    grid_search_registration,
 )
-from eclipse_v1.coords import cartesian_to_polar, polar_to_cartesian
-from eclipse_v1.utils import load_grayscale, apply_transform_single, compute_weighted_average, moon_median
 
 _EDA03_PAIR_STRICT = re.compile(
     r'^v1-eda03_pair_(\d+\.\d+)_(\d+\.\d+)_gamma(\d+\.\d+)\.gif$'
@@ -85,157 +83,16 @@ def estimate_gamma(img0, img1, moon0, moon1, t0, t1, device, step_min=0.001, tra
     return best_gamma
 
 
-def discrepancy_batched_fourier3_apriori(
-    target,
-    warped,
-    moon_center_target,
-    moon_radius_target,
-    moon_centers_warped,
-    moon_radius_warped,
-    batch,
-    blur_sigma,
-    best_setup,
-    apriori_valid,
-):
-    list_of_all = [(target, moon_center_target, moon_radius_target)]
-    for i in range(len(moon_centers_warped)):
-        list_of_all.append((warped[i], moon_centers_warped[i], moon_radius_warped))
-    list_of_all_processed = []
-    antiprotuberance_threshold = None
-    for img, moon_center, moon_radius in list_of_all:
-        radius_max = min(
-            moon_center[0],
-            img.shape[0] - moon_center[0],
-            moon_center[1],
-            img.shape[1] - moon_center[1],
-        )
-        assert 32 < moon_radius < radius_max - 32
-        H_img, W_img = img.shape[0], img.shape[1]
-        n_r = int(radius_max - moon_radius + 1)
-        n_theta = int(2 * math.pi * radius_max)
-        polar_img, _ = cartesian_to_polar(img, moon_center, moon_radius, radius_max, n_r, n_theta)
-        if antiprotuberance_threshold is None:
-            maxidx = polar_img.sum(dim=1).argmax()
-            maxrow = polar_img[maxidx, :]
-            maxrow = maxrow[maxrow > 0]
-            antiprotuberance_threshold = maxrow.quantile(0.9)
-        polar_img[polar_img > antiprotuberance_threshold] = antiprotuberance_threshold
-        polar_img = fill_bottom(polar_img, 4)
-        polar_img = remove_lowfeq(polar_img, 16)
-        img = polar_to_cartesian(polar_img, moon_center, moon_radius, radius_max, H_img, W_img)
-        if blur_sigma > 0:
-            img = gaussian_blur(img, blur_sigma)
-        mask = torch.ones_like(polar_img)
-        mask = polar_to_cartesian(mask, moon_center, moon_radius, radius_max, H_img, W_img)
-        mask = fill_moon(mask, moon_center, moon_radius, 0.0)
-        list_of_all_processed.append((img, mask))
-    target_img, target_mask = list_of_all_processed.pop(0)
-    target_mask = target_mask * apriori_valid.to(target_mask.device)
-    if best_setup is not None:
-        bs_shift_i, bs_shift_j, bs_angle, bs_img, bs_mask = best_setup
-        batch.append((bs_shift_i, bs_shift_j, bs_angle))
-        list_of_all_processed.append((bs_img, bs_mask))
-    assert len(list_of_all_processed) == len(batch)
-    while len(list_of_all_processed) >= 2:
-        shift_i_0, shift_j_0, angle_0 = batch.pop()
-        shift_i_1, shift_j_1, angle_1 = batch.pop()
-        warped_img_0, warped_mask_0 = list_of_all_processed.pop()
-        warped_img_1, warped_mask_1 = list_of_all_processed.pop()
-        mask = target_mask * warped_mask_0 * warped_mask_1
-        diff_0 = ((torch.abs(target_img - warped_img_0) * mask).sum() / (mask.sum() + 1e-9)).item()
-        diff_1 = ((torch.abs(target_img - warped_img_1) * mask).sum() / (mask.sum() + 1e-9)).item()
-        if diff_0 < diff_1:
-            batch.append((shift_i_0, shift_j_0, angle_0))
-            list_of_all_processed.append((warped_img_0, warped_mask_0))
-        else:
-            batch.append((shift_i_1, shift_j_1, angle_1))
-            list_of_all_processed.append((warped_img_1, warped_mask_1))
-    shift_i, shift_j, angle = batch.pop()
-    warped_img, warped_mask = list_of_all_processed.pop()
-    return shift_i, shift_j, angle, warped_img, warped_mask
-
-
 def register_cross_exposure(img0, img1_scaled, moon0, moon1, gamma, t0, t1, device):
-    H, W = img0.shape
     if isinstance(img0, np.ndarray):
         img0 = torch.from_numpy(img0).to(device=device, dtype=torch.float32)
     if isinstance(img1_scaled, np.ndarray):
         img1_scaled = torch.from_numpy(img1_scaled).to(device=device, dtype=torch.float32)
     g0 = img0.clone()
     g1 = img1_scaled.clone()
-    r0, r1 = moon0[2], moon1[2]
     apriori_valid = (g0 * ((t1 / t0) ** (1.0 / gamma)) <= 0.9).to(torch.float32)
     initial_shift_half = 2.0 * (5.0 * (2.0 + 2.0) + 0.0 + 3.0)
-    ci, cj = H / 2.0, W / 2.0
-    r_border = max(H, W)
-    ii = torch.arange(H, device=device, dtype=torch.float32).view(-1, 1).expand(H, W).unsqueeze(0)
-    jj = torch.arange(W, device=device, dtype=torch.float32).view(1, -1).expand(H, W).unsqueeze(0)
-
-    def apply_transform_batched(img, shift_i_t, shift_j_t, cos_a_t, sin_a_t):
-        di = ii - ci - shift_i_t
-        dj = jj - cj - shift_j_t
-        i_src = di * cos_a_t + dj * sin_a_t + ci
-        j_src = -di * sin_a_t + dj * cos_a_t + cj
-        j_norm = 2.0 * j_src / (W - 1) - 1.0 if W > 1 else torch.zeros_like(j_src)
-        i_norm = 2.0 * i_src / (H - 1) - 1.0 if H > 1 else torch.zeros_like(i_src)
-        grid = torch.stack([j_norm, i_norm], dim=-1)
-        img_4d = img.unsqueeze(0).unsqueeze(1).expand(grid.shape[0], 1, H, W)
-        return torch.nn.functional.grid_sample(
-            img_4d, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-        ).squeeze(1)
-
-    best_shift_i, best_shift_j, best_angle = 0.0, 0.0, 0.0
-    step_shift = initial_shift_half / 2.0
-    step_angle = 5.0
-    refine_shift = refine_angle = True
-    best_setup = None
-    while refine_shift or refine_angle:
-        if step_shift < 0.1:
-            refine_shift = False
-        step_angle_in_px = step_angle * r_border * (math.pi / 180.0)
-        if step_angle_in_px < 0.1:
-            refine_angle = False
-        blur_sigma = 0.0 if (step_shift < 2 and step_angle_in_px < 2) else min(8, max(step_angle_in_px, step_shift))
-        shift_i_vals = [best_shift_i] if not refine_shift else [best_shift_i + step_shift * (k - 2) for k in range(5)]
-        shift_j_vals = [best_shift_j] if not refine_shift else [best_shift_j + step_shift * (k - 2) for k in range(5)]
-        angle_vals = [best_angle] if not refine_angle else [best_angle + step_angle * (k - 2) for k in range(5)]
-        triples = [(si, sj, a) for si in shift_i_vals for sj in shift_j_vals for a in angle_vals]
-        GRID_BATCH_SIZE = 8
-        for start in range(0, len(triples), GRID_BATCH_SIZE):
-            batch = triples[start : start + GRID_BATCH_SIZE]
-            N = len(batch)
-            shift_i_t = torch.tensor([t[0] for t in batch], device=device, dtype=torch.float32).view(N, 1, 1)
-            shift_j_t = torch.tensor([t[1] for t in batch], device=device, dtype=torch.float32).view(N, 1, 1)
-            cos_a_t = torch.cos(
-                torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
-            ).view(N, 1, 1)
-            sin_a_t = torch.sin(
-                torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
-            ).view(N, 1, 1)
-            warped = apply_transform_batched(g1.clone(), shift_i_t, shift_j_t, cos_a_t, sin_a_t)
-            moon_centers_warped = transform_moon_center_batched(
-                moon1[0], moon1[1], ci, cj, shift_i_t, shift_j_t, cos_a_t, sin_a_t
-            )
-            best_setup = discrepancy_batched_fourier3_apriori(
-                g0.clone(),
-                warped,
-                moon0[:2],
-                r0,
-                moon_centers_warped,
-                r1,
-                list(batch),
-                blur_sigma,
-                best_setup,
-                apriori_valid,
-            )
-        best_shift_i, best_shift_j, best_angle, _, _ = best_setup
-        is_corner = len(shift_i_vals) > 2 and (
-            best_shift_i in [shift_i_vals[0], shift_i_vals[-1]] or best_shift_j in [shift_j_vals[0], shift_j_vals[-1]]
-        )
-        step_shift = step_shift / 2.0 if (refine_shift and not is_corner) else step_shift
-        is_corner = len(angle_vals) > 2 and best_angle in [angle_vals[0], angle_vals[-1]]
-        step_angle = step_angle / 2.0 if (refine_angle and not is_corner) else step_angle
-    return (float(best_shift_i), float(best_shift_j), float(best_angle))
+    return grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, apriori_valid=apriori_valid)
 
 
 def stage2_load(eda02_pkl: Path):
