@@ -95,7 +95,7 @@ def register_cross_exposure(img0, img1_scaled, moon0, moon1, gamma, t0, t1, devi
     return grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, apriori_valid=apriori_valid)
 
 
-def stage2_load(eda02_pkl: Path):
+def load(eda02_pkl: Path):
     eda02_pkl = Path(eda02_pkl)
     with open(eda02_pkl, "rb") as fd:
         exposure_groups = pickle.load(fd)
@@ -104,7 +104,7 @@ def stage2_load(eda02_pkl: Path):
     return exposure_groups, reg, opt_results
 
 
-def stage2_moon_median_table(exposure_groups: dict) -> dict:
+def moon_median_table(exposure_groups: dict) -> dict:
     moon_by_exp = {}
     for exp in exposure_groups:
         moon_by_exp[exp] = moon_median(exposure_groups[exp])
@@ -113,7 +113,7 @@ def stage2_moon_median_table(exposure_groups: dict) -> dict:
     return moon_by_exp, exposure_times_sorted
 
 
-def stage2_fullsize_averages(
+def fullsize_averages(
     exposure_groups: dict,
     exposure_times_sorted: list,
     opt_results: dict,
@@ -133,7 +133,7 @@ def stage2_fullsize_averages(
     return avg_images
 
 
-def stage2_cross_exposure_consecutive_pairs(
+def cross_exposure_consecutive_pairs(
     exposure_times_sorted: list,
     avg_images: dict,
     moon_by_exp: dict,
@@ -192,7 +192,7 @@ def stage2_cross_exposure_consecutive_pairs(
     return pairs_results
 
 
-def stage2_save_pickle(out_pkl: Path, pairs_results: list) -> Path:
+def save_pickle(out_pkl: Path, pairs_results: list) -> Path:
     cross_reg = {(t0, t1): (shift_i, shift_j, rotation) for (t0, t1, _, shift_i, shift_j, rotation) in pairs_results}
     gamma_by_pair = {(t0, t1): gamma for (t0, t1, gamma, _, _, _) in pairs_results}
     out_pkl = Path(out_pkl)
@@ -265,15 +265,15 @@ def display_clickable_eda03_pair_gif_grid(
     ))
 
 
-def run_stage2(eda02_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
+def run(eda02_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stage 2.")
     device = torch.device("cuda")
 
-    exposure_groups, _reg, opt_results = stage2_load(eda02_pkl)
-    moon_by_exp, exposure_times_sorted = stage2_moon_median_table(exposure_groups)
-    avg_images = stage2_fullsize_averages(exposure_groups, exposure_times_sorted, opt_results, device)
-    pairs_results = stage2_cross_exposure_consecutive_pairs(
+    exposure_groups, _reg, opt_results = load(eda02_pkl)
+    moon_by_exp, exposure_times_sorted = moon_median_table(exposure_groups)
+    avg_images = fullsize_averages(exposure_groups, exposure_times_sorted, opt_results, device)
+    pairs_results = cross_exposure_consecutive_pairs(
         exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir
     )
-    return stage2_save_pickle(out_pkl, pairs_results)
+    return save_pickle(out_pkl, pairs_results)

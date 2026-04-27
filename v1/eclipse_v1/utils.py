@@ -8,6 +8,8 @@ from PIL import Image
 
 from eclipse_v1.coords import cartesian_to_polar, polar_to_cartesian
 
+GRID_BATCH_SIZE = 8
+
 
 def load_grayscale(ii, device):
     """Load an image file as a float32 grayscale tensor on `device`."""
@@ -302,7 +304,6 @@ def grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, a
         shift_j_vals = [best_shift_j] if not refine_shift else [best_shift_j + step_shift * (k - 2) for k in range(5)]
         angle_vals = [best_angle] if not refine_angle else [best_angle + step_angle * (k - 2) for k in range(5)]
         triples = [(si, sj, a) for si in shift_i_vals for sj in shift_j_vals for a in angle_vals]
-        GRID_BATCH_SIZE = 8
         for start in range(0, len(triples), GRID_BATCH_SIZE):
             batch = triples[start : start + GRID_BATCH_SIZE]
             N = len(batch)

@@ -23,6 +23,9 @@ import os
 
 from eclipse_v1.utils import load_grayscale, apply_transform_single, compute_weighted_average, compose_transforms
 
+N_ITER = 100_000
+N_PHASE = 50_000
+
 
 def prune_brightness_outliers(exposure_groups, reg, std_reduction_factor=3.0):
     for exp_key in sorted(exposure_groups.keys()):
@@ -201,7 +204,7 @@ def _run_optimizer_phases(loss_fn, lr_schedule, abs_xy, abs_angle_t, exposure_ti
     return ls1.item(), lr1.item(), abs_xy.detach(), abs_angle_t.detach()
 
 
-def run_group(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, warmup_frac=0.1):
+def optimize_group_poses(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, warmup_frac=0.1):
     abs_xy, abs_angle_t = _initial_pose_estimate(n, reg_exp, device)
 
     pairs = list(reg_exp.keys())
@@ -235,11 +238,10 @@ def run_group(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, w
         progress = (step - n_steps * warmup_frac) / max(1, n_steps * (1 - warmup_frac))
         return 0.5 * peak_lr * (1 + math.cos(math.pi * min(1.0, progress)))
 
-    n_phase = 50_000
-    return _run_optimizer_phases(loss_fn, lr_schedule, abs_xy, abs_angle_t, exposure_time, peak_lr, n_phase)
+    return _run_optimizer_phases(loss_fn, lr_schedule, abs_xy, abs_angle_t, exposure_time, peak_lr, N_PHASE)
 
 
-def stage1_load(eda00_pkl: Path):
+def load(eda00_pkl: Path):
     """Load stage-0 pickle: exposure_groups, pairwise reg (mutable reg dict for pruning)."""
     with open(eda00_pkl, "rb") as fd:
         exposure_groups = pickle.load(fd)
@@ -247,13 +249,13 @@ def stage1_load(eda00_pkl: Path):
     return exposure_groups, reg
 
 
-def stage1_prune_groups(exposure_groups, reg) -> None:
+def prune_groups(exposure_groups, reg) -> None:
     """Brightness outlier drop (large groups), then triplet-consistency pruning (in-place)."""
     prune_brightness_outliers(exposure_groups, reg, std_reduction_factor=3.0)
     prune_failed_registrations(exposure_groups, reg, 1.0)
 
 
-def stage1_optimize_poses_and_debug(
+def optimize_poses_and_debug(
     exposure_groups,
     reg,
     device: torch.device,
@@ -262,7 +264,6 @@ def stage1_optimize_poses_and_debug(
     warmup_frac: float = 0.1,
 ) -> dict:
     """Per exposure: Adam on global poses to match all pairwise regs; write crop/GIF debug."""
-    n_iter = 100_000
     opt_results = {}
     for exposure_time in sorted(exposure_groups.keys()):
         group = list(exposure_groups[exposure_time])
@@ -276,8 +277,8 @@ def stage1_optimize_poses_and_debug(
         }
         if not reg_exp:
             continue
-        _, _, abs_xy, abs_angle_t = run_group(
-            exposure_time, n, reg_exp, device, n_iter=n_iter, peak_lr=peak_lr, warmup_frac=warmup_frac
+        _, _, abs_xy, abs_angle_t = optimize_group_poses(
+            exposure_time, n, reg_exp, device, n_iter=N_ITER, peak_lr=peak_lr, warmup_frac=warmup_frac
         )
         opt_results[exposure_time] = {
             "abs_xy": abs_xy.detach().cpu().numpy().astype(np.float64),
@@ -320,7 +321,7 @@ def stage1_optimize_poses_and_debug(
     return opt_results
 
 
-def stage1_save_pickle(out_pkl: Path, exposure_groups, reg: dict, opt_results: dict) -> Path:
+def save_pickle(out_pkl: Path, exposure_groups, reg: dict, opt_results: dict) -> Path:
     reg_plain = {k: (float(v[0]), float(v[1]), float(v[2])) for k, v in reg.items()}
     out_pkl = Path(out_pkl)
     with open(out_pkl, "wb") as fd:
@@ -331,15 +332,15 @@ def stage1_save_pickle(out_pkl: Path, exposure_groups, reg: dict, opt_results: d
     return out_pkl
 
 
-def run_stage1(eda00_pkl: Path, out_pkl: Path, debug_img_dir: Path) -> Path:
+def run(eda00_pkl: Path, out_pkl: Path, debug_img_dir: Path) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stage 1.")
     device = torch.device("cuda")
 
-    exposure_groups, reg = stage1_load(eda00_pkl)
-    stage1_prune_groups(exposure_groups, reg)
-    opt_results = stage1_optimize_poses_and_debug(exposure_groups, reg, device, debug_img_dir)
-    return stage1_save_pickle(out_pkl, exposure_groups, reg, opt_results)
+    exposure_groups, reg = load(eda00_pkl)
+    prune_groups(exposure_groups, reg)
+    opt_results = optimize_poses_and_debug(exposure_groups, reg, device, debug_img_dir)
+    return save_pickle(out_pkl, exposure_groups, reg, opt_results)
 
 
 # Strict: v1-eda02_debugimg_<exposure>_anim.gif (exposure substring used in captions as-is)

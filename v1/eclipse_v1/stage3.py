@@ -27,18 +27,20 @@ from eclipse_v1.coords import cartesian_to_polar, polar_to_cartesian
 from eclipse_v1.utils import load_grayscale, apply_transform_single, compute_weighted_average, moon_median
 
 # --- Parameters for the sliding-window FFT sharpen (visible from notebooks) ---
-STAGE3_PATCH_SIDE = 256
-STAGE3_PATCH_STRIDE = 8
-STAGE3_FFT_INWARD_MEDIAN_SPAN = 32
-STAGE3_UNSHARP_GAUSSIAN_SIGMAS = (2.0, 4.0, 8.0)
-STAGE3_UNSHARP_WEIGHTS = (8.0, 8.0, 0.5)
+PATCH_SIDE = 256
+PATCH_STRIDE = 8
+FFT_INWARD_MEDIAN_SPAN = 32
+UNSHARP_GAUSSIAN_SIGMAS = (2.0, 4.0, 8.0)
+UNSHARP_WEIGHTS = (8.0, 8.0, 0.5)
 
 MERGE_WEIGHT_SIGMA = 0.2
+VALID_THRESH = 0.9999
+RGB_DIM_QUOTIENTS = (0.25, 0.28, 0.37)
 
 
-def stage3_count_fft_patch_placements(height: int, width: int) -> tuple[int, int, int]:
+def count_fft_patch_placements(height: int, width: int) -> tuple[int, int, int]:
     """How many patch origins (row starts × col starts) the FFT sharpen scans; total per blur sigma."""
-    a, stride = STAGE3_PATCH_SIDE, STAGE3_PATCH_STRIDE
+    a, stride = PATCH_SIDE, PATCH_STRIDE
     if height < a or width < a:
         return 0, 0, 0
     n_r = len(range(0, height - a + 1, stride))
@@ -48,7 +50,7 @@ def stage3_count_fft_patch_placements(height: int, width: int) -> tuple[int, int
 
 @dataclass
 class Stage3Context:
-    """Mutable state passed through stepped stage-3 functions (notebooks) or `run_stage3` (one-shot)."""
+    """Mutable state passed through stepped stage-3 functions (notebooks) or `run` (one-shot)."""
 
     workdir: Path
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
@@ -181,7 +183,7 @@ def _amp_cart_to_polar_bilinear(amp, a, r_max, Nr, Ntheta, ci, cj):
     return P
 
 
-def _polar_add_median_inward10(P, inward_median_span: int):
+def _polar_add_inward_median(P, inward_median_span: int):
     Nr, Ntheta = P.shape
     k = inward_median_span
     if k < 1:
@@ -233,7 +235,7 @@ def _fft_amp_polar_median_roundtrip(amp: torch.Tensor, inward_median_span: int) 
     cj = (a - 1) / 2.0
     r_max, Nr, Ntheta = _polar_fft_geometry(a)
     P = _amp_cart_to_polar_bilinear(amp, a, r_max, Nr, Ntheta, ci, cj)
-    P = _polar_add_median_inward10(P, inward_median_span)
+    P = _polar_add_inward_median(P, inward_median_span)
     return _amp_polar_to_cart_bilinear(P, a, r_max, Nr, Ntheta, ci, cj)
 
 
@@ -479,7 +481,7 @@ def _sliding_diff_smooth_for_sigma(
     return (acc / wsum.clamp(min=1e-9)).cpu().numpy()
 
 
-def stage3_load_inputs(ctx: Stage3Context) -> None:
+def load_inputs(ctx: Stage3Context) -> None:
     """Load eda02/eda03 pickles; set exposure list, reference exposure, and moon prior."""
     with open(ctx.workdir / "v1-eda02.pkl", "rb") as fd:
         ctx.exposure_groups = pickle.load(fd)
@@ -496,7 +498,7 @@ def stage3_load_inputs(ctx: Stage3Context) -> None:
     print(f"cross_reg pairs: {len(ctx.cross_reg)}, gamma_by_pair: {len(ctx.gamma_by_pair)}")
 
 
-def stage3_build_per_exposure_averages(ctx: Stage3Context) -> None:
+def build_per_exposure_averages(ctx: Stage3Context) -> None:
     """GPU stack mean per exposure (moon blackened, warped with stage-1 poses)."""
     device = ctx.device
     ctx.avg_images.clear()
@@ -513,7 +515,7 @@ def stage3_build_per_exposure_averages(ctx: Stage3Context) -> None:
     print(f"Reference shape H={ctx.H_ref}, W={ctx.W_ref}")
 
 
-def stage3_warp_merge_to_composite(ctx: Stage3Context) -> None:
+def warp_merge_to_composite(ctx: Stage3Context) -> None:
     """Chain cross_reg, gamma scaling, warp to ref grid; weighted merge → full composite + valid mask."""
     device = ctx.device
     exposure_times_sorted = ctx.exposure_times_sorted
@@ -588,7 +590,7 @@ def stage3_warp_merge_to_composite(ctx: Stage3Context) -> None:
     print(f"Composite shape {ctx.composite.shape}, dtype {ctx.composite.dtype}")
 
 
-def stage3_crop_and_save_composite(ctx: Stage3Context) -> None:
+def crop_and_save_composite(ctx: Stage3Context) -> None:
     """Crop to mutual coverage; save float composite + preview; set crop geometry and initial moon (pre-find_moon)."""
     assert ctx.composite is not None and ctx.valid_all is not None and ctx.moon_ref is not None
     out_dir = ctx.workdir
@@ -596,7 +598,6 @@ def stage3_crop_and_save_composite(ctx: Stage3Context) -> None:
     valid_all = ctx.valid_all
     mi, mj, moon_r0 = ctx.moon_ref
 
-    VALID_THRESH = 0.9999
     all_valid_mask = valid_all >= VALID_THRESH
     rows = np.any(all_valid_mask, axis=1)
     cols = np.any(all_valid_mask, axis=0)
@@ -779,7 +780,7 @@ def _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n
     return ((display_t - p3_at) / span).clamp(0.0, 1.0)
 
 
-def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
+def radial_normalize_display(ctx: Stage3Context) -> None:
     """Refine moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1])."""
     assert ctx.composite_crop is not None
     device = ctx.device
@@ -819,13 +820,13 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
     print(f"Saved {ctx.workdir / 'v1-eda05_radial_normalize.png'}")
 
 
-def stage3_fft_unsharp_and_save(ctx: Stage3Context) -> None:
+def fft_unsharp_and_save(ctx: Stage3Context) -> None:
     """Sliding-patch FFT-smoothed unsharp (three σ); writes sharpened PNG and debug figure."""
     assert ctx.display is not None and ctx.moon_mask is not None
-    inward_median_span = STAGE3_FFT_INWARD_MEDIAN_SPAN
-    strength_r2, strength_r4, strength_r8 = STAGE3_UNSHARP_WEIGHTS
-    a = STAGE3_PATCH_SIDE
-    stride = STAGE3_PATCH_STRIDE
+    inward_median_span = FFT_INWARD_MEDIAN_SPAN
+    strength_r2, strength_r4, strength_r8 = UNSHARP_WEIGHTS
+    a = PATCH_SIDE
+    stride = PATCH_STRIDE
     dev = ctx.device
     display = ctx.display
     mi_crop, mj_crop, moon_r = ctx.mi_crop, ctx.mj_crop, ctx.moon_r
@@ -833,13 +834,13 @@ def stage3_fft_unsharp_and_save(ctx: Stage3Context) -> None:
     display_for_blur = display
 
     diff_smooth_r2 = _sliding_diff_smooth_for_sigma(
-        display_for_blur, display_for_blur, 2.0, inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
+        display_for_blur, display_for_blur, UNSHARP_GAUSSIAN_SIGMAS[0], inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
     )
     diff_smooth_r4 = _sliding_diff_smooth_for_sigma(
-        display_for_blur, display_for_blur, 4.0, inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
+        display_for_blur, display_for_blur, UNSHARP_GAUSSIAN_SIGMAS[1], inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
     )
     diff_smooth_r8 = _sliding_diff_smooth_for_sigma(
-        display_for_blur, display_for_blur, 8.0, inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
+        display_for_blur, display_for_blur, UNSHARP_GAUSSIAN_SIGMAS[2], inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
     )
 
     combined_diff = strength_r2 * diff_smooth_r2 + strength_r4 * diff_smooth_r4 + strength_r8 * diff_smooth_r8
@@ -864,7 +865,7 @@ def stage3_fft_unsharp_and_save(ctx: Stage3Context) -> None:
     print(f"Saved {out_png}")
 
 
-def stage3_rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
+def rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     """RGB + vignette PNG and v1-eda05_radial.pkl sidecar."""
     assert ctx.sharpened_fft_diff is not None and ctx.moon_mask is not None #and ctx.p3_at is not None
     gray = np.clip(ctx.sharpened_fft_diff.astype(np.float64), 0.0, 1.0)
@@ -873,7 +874,6 @@ def stage3_rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     B = 0.30 + 0.70 * gray
     display_rgb = np.clip(np.stack([R, G, B], axis=-1), 0.0, 1.0)
 
-    dim_q = (0.25, 0.28, 0.37)
     H, W = display_rgb.shape[0], display_rgb.shape[1]
     ci, cj = float(ctx.mi_crop), float(ctx.mj_crop)
     sigma = max(
@@ -888,7 +888,7 @@ def stage3_rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     r = np.sqrt((ii - ci) ** 2 + (jj - cj) ** 2)
     g = np.exp(-0.5 * (r / sigma) ** 2)
     exp_half = np.exp(-0.5)
-    qs = [(1.0 - dq) / (1.0 - exp_half) for dq in dim_q]
+    qs = [(1.0 - dq) / (1.0 - exp_half) for dq in RGB_DIM_QUOTIENTS]
     scale = np.stack([1.0 - q * (1.0 - g) for q in qs], axis=-1)
     display_rgb = display_rgb * scale
     display_rgb = np.clip(display_rgb, 0.0, 1.0)
@@ -905,13 +905,13 @@ def stage3_rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     print(f"Saved {out_png}")
 
 
-def run_stage3(workdir: Path) -> None:
+def run(workdir: Path) -> None:
     """Run full eda05 pipeline; writes v1-eda05_* artifacts under workdir."""
     ctx = Stage3Context(workdir=workdir)
-    stage3_load_inputs(ctx)
-    stage3_build_per_exposure_averages(ctx)
-    stage3_warp_merge_to_composite(ctx)
-    stage3_crop_and_save_composite(ctx)
-    stage3_radial_normalize_display(ctx)
-    stage3_fft_unsharp_and_save(ctx)
-    stage3_rgb_vignette_and_radial_pickle(ctx)
+    load_inputs(ctx)
+    build_per_exposure_averages(ctx)
+    warp_merge_to_composite(ctx)
+    crop_and_save_composite(ctx)
+    radial_normalize_display(ctx)
+    fft_unsharp_and_save(ctx)
+    rgb_vignette_and_radial_pickle(ctx)

@@ -24,13 +24,13 @@ from eclipse_v1 import stage1 as s1
 from eclipse_v1 import stage2 as s2
 from eclipse_v1.stage3 import (
     Stage3Context,
-    stage3_build_per_exposure_averages,
-    stage3_crop_and_save_composite,
-    stage3_fft_unsharp_and_save,
-    stage3_load_inputs,
-    stage3_radial_normalize_display,
-    stage3_rgb_vignette_and_radial_pickle,
-    stage3_warp_merge_to_composite,
+    build_per_exposure_averages,
+    crop_and_save_composite,
+    fft_unsharp_and_save,
+    load_inputs,
+    radial_normalize_display,
+    rgb_vignette_and_radial_pickle,
+    warp_merge_to_composite,
 )
 
 configure_cuda_visible_devices()
@@ -54,20 +54,20 @@ print("=== Stage 0: ingest, moon detection, intra-exposure registration ===")
 image_infos = s0.get_image_infos(DATA_ROOT)
 print(f"Found {len(image_infos)} images, first: {image_infos[0].path}")
 
-exposure_groups = s0.stage0_group_by_exposure(image_infos)
+exposure_groups = s0.group_by_exposure(image_infos)
 
-s0.stage0_detect_moons(image_infos)
+s0.detect_moons(image_infos)
 print("Exposure groups after moon detection:")
-s0.stage0_print_exposure_groups_stats(exposure_groups)
+s0.print_exposure_groups_stats(exposure_groups)
 
 print("Pruning failed moon estimations")
-s0.stage0_prune_moon_info_for_radius_outliers(exposure_groups)
+s0.prune_moon_info_for_radius_outliers(exposure_groups)
 
-interp = s0.stage0_interpolate_missing_moons(image_infos, exposure_groups)
-s0.stage0_set_moon_position_std(image_infos, exposure_groups, interp)
+interp = s0.interpolate_missing_moons(image_infos, exposure_groups)
+s0.set_moon_position_std(image_infos, exposure_groups, interp)
 
-reg = s0.stage0_register_intra_exposure_pairs(exposure_groups)
-s0.stage0_save_pickle(exposure_groups, reg, PK_EDA00)
+reg = s0.register_intra_exposure_pairs(exposure_groups)
+s0.save_pickle(exposure_groups, reg, PK_EDA00)
 print(f"Stage 0 done → {PK_EDA00}")
 
 
@@ -75,14 +75,14 @@ print(f"Stage 0 done → {PK_EDA00}")
 
 print("\n=== Stage 1: prune stacks, global pose fit per exposure ===")
 
-exposure_groups, reg = s1.stage1_load(PK_EDA00)
-s1.stage1_prune_groups(exposure_groups, reg)
+exposure_groups, reg = s1.load(PK_EDA00)
+s1.prune_groups(exposure_groups, reg)
 
-opt_results = s1.stage1_optimize_poses_and_debug(
+opt_results = s1.optimize_poses_and_debug(
     exposure_groups, reg, device, debug_img_dir=WORKDIR
 )
 
-s1.stage1_save_pickle(PK_EDA02, exposure_groups, reg, opt_results)
+s1.save_pickle(PK_EDA02, exposure_groups, reg, opt_results)
 print(f"Stage 1 done → {PK_EDA02}")
 
 
@@ -90,18 +90,18 @@ print(f"Stage 1 done → {PK_EDA02}")
 
 print("\n=== Stage 2: full-res stack means, cross-exposure chain ===")
 
-exposure_groups, _reg, opt_results = s2.stage2_load(PK_EDA02)
-moon_by_exp, exposure_times_sorted = s2.stage2_moon_median_table(exposure_groups)
+exposure_groups, _reg, opt_results = s2.load(PK_EDA02)
+moon_by_exp, exposure_times_sorted = s2.moon_median_table(exposure_groups)
 
-avg_images = s2.stage2_fullsize_averages(
+avg_images = s2.fullsize_averages(
     exposure_groups, exposure_times_sorted, opt_results, device
 )
 
-pairs_results = s2.stage2_cross_exposure_consecutive_pairs(
+pairs_results = s2.cross_exposure_consecutive_pairs(
     exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir=WORKDIR
 )
 
-s2.stage2_save_pickle(PK_EDA03, pairs_results)
+s2.save_pickle(PK_EDA03, pairs_results)
 print(f"Stage 2 done → {PK_EDA03}")
 
 
@@ -110,12 +110,12 @@ print(f"Stage 2 done → {PK_EDA03}")
 print("\n=== Stage 3: reference merge, radial tone, FFT sharpen, RGB ===")
 
 ctx = Stage3Context(workdir=WORKDIR)
-stage3_load_inputs(ctx)
-stage3_build_per_exposure_averages(ctx)
-stage3_warp_merge_to_composite(ctx)
-stage3_crop_and_save_composite(ctx)
-stage3_radial_normalize_display(ctx)
-stage3_fft_unsharp_and_save(ctx)
-stage3_rgb_vignette_and_radial_pickle(ctx)
+load_inputs(ctx)
+build_per_exposure_averages(ctx)
+warp_merge_to_composite(ctx)
+crop_and_save_composite(ctx)
+radial_normalize_display(ctx)
+fft_unsharp_and_save(ctx)
+rgb_vignette_and_radial_pickle(ctx)
 
 print("\nPipeline complete. Outputs in", WORKDIR)

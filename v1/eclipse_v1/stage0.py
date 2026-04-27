@@ -111,6 +111,9 @@ N_TRIPLETS = 1024
 N_CLUSTER = 256
 REFINE_ITERATIONS = 3
 MIN_TRIPLET_DEGREES = 30
+RADIUS_STD_THRESHOLD = 1.0
+MIN_GROUP_ELMS = 3
+SUN_DRIFT_RATE = 0.001
 
 
 def _indices_within_degrees(center: int, deg: int) -> set:
@@ -356,14 +359,14 @@ def register_equal_exposure(image_info0, image_info1):
     moon_radius_avg = (moon0[2] + moon1[2]) / 2.0
     u0 = image_info0.moon_pos_std_px if image_info0.moon_pos_std_px is not None else 2.0
     u1 = image_info1.moon_pos_std_px if image_info1.moon_pos_std_px is not None else 2.0
-    sun_drift_per_sec = 0.001 * moon_radius_avg
+    sun_drift_per_sec = SUN_DRIFT_RATE * moon_radius_avg
     dt_sec = abs(image_info1.timestamp - image_info0.timestamp)
     possible_sun_drift = dt_sec * sun_drift_per_sec
     initial_shift_half = 2.0 * (5.0 * (u0 + u1) + possible_sun_drift + 3.0)
     return grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device)
 
 
-def stage0_detect_moons(image_infos: list) -> None:
+def detect_moons(image_infos: list) -> None:
     """GPU: approximate disk finder + gradient/triplet refine; sets moon on each ImageInfo."""
     for ii in tqdm.tqdm(image_infos, desc="Finding moon"):
         img = Image.open(ii.path)
@@ -378,7 +381,7 @@ def stage0_detect_moons(image_infos: list) -> None:
         ii.moon_info_origin = MoonInfoOrigin.DIRECT
 
 
-def stage0_print_exposure_groups_stats(exposure_groups: dict) -> None:
+def print_exposure_groups_stats(exposure_groups: dict) -> None:
     for exposure_time in sorted(exposure_groups.keys()):
         group = exposure_groups[exposure_time]
         radii = [ii.moon[2] for ii in group if ii.moon is not None]
@@ -388,7 +391,7 @@ def stage0_print_exposure_groups_stats(exposure_groups: dict) -> None:
         )
 
 
-def stage0_group_by_exposure(image_infos: list) -> dict:
+def group_by_exposure(image_infos: list) -> dict:
     """Build exposure_time -> [ImageInfo, ...] and print per-group radius stats."""
     exposure_groups = collections.defaultdict(list)
     for ii in image_infos:
@@ -396,11 +399,8 @@ def stage0_group_by_exposure(image_infos: list) -> dict:
     return exposure_groups
 
 
-def stage0_prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
+def prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
     """Drop moons that disagree with rolling reference radius (in-place)."""
-    RADIUS_STD_THRESHOLD = 1.0
-    MIN_GROUP_ELMS = 3
-
     def radius(ii):
         return ii.moon[2]
 
@@ -439,7 +439,7 @@ def stage0_prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
                     ii.moon_info_origin = None
 
 
-def stage0_interpolate_missing_moons(image_infos: list, exposure_groups: dict) -> tuple:
+def interpolate_missing_moons(image_infos: list, exposure_groups: dict) -> tuple:
     """Linear fit moon (i,j) vs time for direct detections; fill missing + radii (in-place)."""
     pts_with_moon = [
         (ii.timestamp, ii.moon[0], ii.moon[1])
@@ -475,11 +475,10 @@ def stage0_interpolate_missing_moons(image_infos: list, exposure_groups: dict) -
     return interpolate_moon_at_time
 
 
-def stage0_set_moon_position_std(
+def set_moon_position_std(
     image_infos: list, exposure_groups: dict, interpolate_moon_at_time
 ) -> None:
     """Residual std on direct points -> moon_pos_std_px per image (in-place)."""
-    MIN_GROUP_ELMS = 3
     residuals_i = []
     residuals_j = []
     for ii in image_infos:
@@ -551,7 +550,7 @@ def _print_triplet_consistency(reg, exposure_time, group):
     print(f"  Check 2: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}")
 
 
-def stage0_register_intra_exposure_pairs(exposure_groups: dict) -> dict:
+def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
     """For each exposure, all ordered pairs: Fourier-style registration on GPU (slow loop)."""
     reg = {}
     for exposure_time in sorted(exposure_groups.keys()):
@@ -572,7 +571,7 @@ def stage0_register_intra_exposure_pairs(exposure_groups: dict) -> dict:
     return reg
 
 
-def stage0_save_pickle(exposure_groups: dict, reg: dict, out_path: str | Path) -> Path:
+def save_pickle(exposure_groups: dict, reg: dict, out_path: str | Path) -> Path:
     out_path = Path(out_path)
     with open(out_path, "wb") as fd:
         pickle.dump(exposure_groups, fd)
@@ -581,15 +580,15 @@ def stage0_save_pickle(exposure_groups: dict, reg: dict, out_path: str | Path) -
     return out_path
 
 
-def run_stage0(data_root: str | Path, out_path: str | Path) -> Path:
+def run(data_root: str | Path, out_path: str | Path) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stage 0.")
     out_path = Path(out_path)
     image_infos = get_image_infos(data_root)
-    stage0_detect_moons(image_infos)
-    exposure_groups = stage0_group_by_exposure(image_infos)
-    stage0_prune_moon_info_for_radius_outliers(exposure_groups)
-    interp = stage0_interpolate_missing_moons(image_infos, exposure_groups)
-    stage0_set_moon_position_std(image_infos, exposure_groups, interp)
-    reg = stage0_register_intra_exposure_pairs(exposure_groups)
-    return stage0_save_pickle(exposure_groups, reg, out_path)
+    detect_moons(image_infos)
+    exposure_groups = group_by_exposure(image_infos)
+    prune_moon_info_for_radius_outliers(exposure_groups)
+    interp = interpolate_missing_moons(image_infos, exposure_groups)
+    set_moon_position_std(image_infos, exposure_groups, interp)
+    reg = register_intra_exposure_pairs(exposure_groups)
+    return save_pickle(exposure_groups, reg, out_path)
