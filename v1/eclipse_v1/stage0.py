@@ -129,8 +129,7 @@ def sample_triplet_indices(n_pts: int, min_degrees: int = MIN_TRIPLET_DEGREES):
     return (a, b, c)
 
 
-def refine_moon(img: torch.Tensor, center_i: float, center_j: float):
-    assert img.ndim == 3 and img.shape[2] == 3
+def _refine_moon_find_sector_edge_points(img: torch.Tensor, center_i: float, center_j: float):
     H, W = img.shape[0], img.shape[1]
     dev = img.device
     img_size = float(max(H, W))
@@ -155,7 +154,6 @@ def refine_moon(img: torch.Tensor, center_i: float, center_j: float):
     dot_product = grad_x * u_x + grad_y * u_y
     dot_product_flat = dot_product.reshape(-1)
     sector_flat = sector_id.reshape(-1)
-    W_t = W
     points_list = []
     for s in range(N_SECTORS):
         mask = sector_flat == s
@@ -164,12 +162,12 @@ def refine_moon(img: torch.Tensor, center_i: float, center_j: float):
                 mask, dot_product_flat, torch.tensor(-1e9, device=dev, dtype=torch.float32)
             )
             idx = masked.argmax().item()
-            i, j = idx // W_t, idx % W_t
-            points_list.append((i, j))
-    n_pts = len(points_list)
-    if n_pts < 3:
-        return (center_i, center_j, 0.0)
+            points_list.append((idx // W, idx % W))
+    return points_list, img_size
 
+
+def _refine_moon_cluster_circumcenters(points_list, img_size):
+    n_pts = len(points_list)
     circumcenters, radii = [], []
     while len(circumcenters) < N_TRIPLETS:
         a, b, c = sample_triplet_indices(n_pts)
@@ -203,6 +201,14 @@ def refine_moon(img: torch.Tensor, center_i: float, center_j: float):
     cj = float(cluster_pts[:, 1].mean())
     radius = float(cluster_radii.mean())
     return (ci, cj, radius)
+
+
+def refine_moon(img: torch.Tensor, center_i: float, center_j: float):
+    assert img.ndim == 3 and img.shape[2] == 3
+    points_list, img_size = _refine_moon_find_sector_edge_points(img, center_i, center_j)
+    if len(points_list) < 3:
+        return (center_i, center_j, 0.0)
+    return _refine_moon_cluster_circumcenters(points_list, img_size)
 
 
 def find_moon(img: torch.Tensor, i0: float, j0: float):
@@ -507,6 +513,44 @@ def stage0_set_moon_position_std(
                 ii.moon_pos_std_px = moon_position_uncertainty_px
 
 
+def _print_pair_consistency(reg, exposure_time, group):
+    n = len(group)
+    res_i, res_j, res_rot = [], [], []
+    for a, b in itertools.combinations(range(n), 2):
+        rab = reg[(exposure_time, a, b)]
+        rba = reg[(exposure_time, b, a)]
+        res_i.append(rab[0] + rba[0])
+        res_j.append(rab[1] + rba[1])
+        res_rot.append(rab[2] + rba[2])
+    res_i = np.array(res_i)
+    res_j = np.array(res_j)
+    res_rot = np.array(res_rot)
+    ijmean = 0.5 * (np.mean(np.abs(res_i)) + np.mean(np.abs(res_j)))
+    ijmax = float(max(np.max(np.abs(res_i)), np.max(np.abs(res_j))))
+    rotmean = float(np.mean(np.abs(res_rot)))
+    rotmax = float(np.max(np.abs(res_rot)))
+    print(f"  Check 1: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}")
+
+
+def _print_triplet_consistency(reg, exposure_time, group):
+    n = len(group)
+    tri_i, tri_j, tri_rot = [], [], []
+    for a, b, c in itertools.permutations(range(n), 3):
+        rab = reg[(exposure_time, a, b)]
+        rbc = reg[(exposure_time, b, c)]
+        rac = reg[(exposure_time, a, c)]
+        composed = compose_transforms(rab[0], rab[1], rab[2], rbc[0], rbc[1], rbc[2])
+        tri_i.append(composed[0] - rac[0])
+        tri_j.append(composed[1] - rac[1])
+        tri_rot.append(composed[2] - rac[2])
+    tri_i, tri_j, tri_rot = np.array(tri_i), np.array(tri_j), np.array(tri_rot)
+    ijmean = 0.5 * (np.mean(np.abs(tri_i)) + np.mean(np.abs(tri_j)))
+    ijmax = float(max(np.max(np.abs(tri_i)), np.max(np.abs(tri_j))))
+    rotmean = float(np.mean(np.abs(tri_rot)))
+    rotmax = float(np.max(np.abs(tri_rot)))
+    print(f"  Check 2: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}")
+
+
 def stage0_register_intra_exposure_pairs(exposure_groups: dict) -> dict:
     """For each exposure, all ordered pairs: Fourier-style registration on GPU (slow loop)."""
     reg = {}
@@ -522,44 +566,9 @@ def stage0_register_intra_exposure_pairs(exposure_groups: dict) -> dict:
             key = (exposure_time, i, j)
             shift_i, shift_j, rotation = register_equal_exposure(group[i], group[j])
             reg[key] = (shift_i, shift_j, rotation)
-        # registration done, now just compute some debuging statistics
-        res_i, res_j, res_rot = [], [], []
-        for a, b in itertools.combinations(range(n), 2):
-            rab = reg[(exposure_time, a, b)]
-            rba = reg[(exposure_time, b, a)]
-            res_i.append(rab[0] + rba[0])
-            res_j.append(rab[1] + rba[1])
-            res_rot.append(rab[2] + rba[2])
-        res_i = np.array(res_i)
-        res_j = np.array(res_j)
-        res_rot = np.array(res_rot)
-        ijmean = 0.5 * (np.mean(np.abs(res_i)) + np.mean(np.abs(res_j)))
-        ijmax = float(max(np.max(np.abs(res_i)), np.max(np.abs(res_j))))
-        rotmean = float(np.mean(np.abs(res_rot)))
-        rotmax = float(np.max(np.abs(res_rot)))
-        print(
-            f"  Check 1: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}"
-        )
+        _print_pair_consistency(reg, exposure_time, group)
         if n >= 3:
-            tri_i, tri_j, tri_rot = [], [], []
-            for a, b, c in itertools.permutations(range(n), 3):
-                rab = reg[(exposure_time, a, b)]
-                rbc = reg[(exposure_time, b, c)]
-                rac = reg[(exposure_time, a, c)]
-                composed = compose_transforms(
-                    rab[0], rab[1], rab[2], rbc[0], rbc[1], rbc[2]
-                )
-                tri_i.append(composed[0] - rac[0])
-                tri_j.append(composed[1] - rac[1])
-                tri_rot.append(composed[2] - rac[2])
-            tri_i, tri_j, tri_rot = np.array(tri_i), np.array(tri_j), np.array(tri_rot)
-            ijmean = 0.5 * (np.mean(np.abs(tri_i)) + np.mean(np.abs(tri_j)))
-            ijmax = float(max(np.max(np.abs(tri_i)), np.max(np.abs(tri_j))))
-            rotmean = float(np.mean(np.abs(tri_rot)))
-            rotmax = float(np.max(np.abs(tri_rot)))
-            print(
-                f"  Check 2: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}"
-            )
+            _print_triplet_consistency(reg, exposure_time, group)
     return reg
 
 

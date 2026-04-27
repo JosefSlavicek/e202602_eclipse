@@ -112,7 +112,8 @@ def prune_failed_registrations(exposure_groups, reg, threshold):
             print(f"prune_failed_registrations: exp={exp_key:.5f} removed image (idx {k}) {removed_ii.path.name}")
 
 
-def run_group(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, warmup_frac=0.1):
+def _initial_pose_estimate(n, reg_exp, device):
+    """Greedy spanning-tree walk: anchor on minimum-shift pair, expand outward."""
     best_ij = None
     best_mag = float("inf")
     for (i, j) in reg_exp:
@@ -154,14 +155,54 @@ def run_group(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, w
         theta_ref = abs_angle[ref]
         dx = math.cos(theta_ref) * s_i - math.sin(theta_ref) * s_j
         dy = math.sin(theta_ref) * s_i + math.cos(theta_ref) * s_j
-        theta_k = theta_ref - r_rad
         abs_x[k] = abs_x[ref] + dx
         abs_y[k] = abs_y[ref] + dy
-        abs_angle[k] = theta_k
+        abs_angle[k] = theta_ref - r_rad
         placed.add(k)
 
     abs_xy = torch.tensor([[abs_x[i], abs_y[i]] for i in range(n)], dtype=torch.float32, device=device, requires_grad=True)
     abs_angle_t = torch.tensor([abs_angle[i] for i in range(n)], dtype=torch.float32, device=device, requires_grad=True)
+    return abs_xy, abs_angle_t
+
+
+def _run_optimizer_phases(loss_fn, lr_schedule, abs_xy, abs_angle_t, exposure_time, peak_lr, n_phase):
+    """Two-phase Adam: rotations first (if nonzero), then translations."""
+    with torch.no_grad():
+        ls0, lr0 = loss_fn()
+    print(f"\n  exp={exposure_time}: initial loss_shift={ls0.item():.6f} loss_rot={lr0.item():.6f}")
+
+    if lr0 > 0.0:
+        opt_rot = torch.optim.Adam([abs_angle_t], lr=peak_lr)
+        for step in tqdm.tqdm(range(n_phase), desc="angles"):
+            opt_rot.zero_grad()
+            for g in opt_rot.param_groups:
+                g["lr"] = lr_schedule(step, n_phase)
+            _, loss_rot = loss_fn()
+            loss_rot.backward()
+            opt_rot.step()
+
+        with torch.no_grad():
+            ls0, lr0 = loss_fn()
+        print(f"  exp={exposure_time}: phase1 loss_shift={ls0.item():.6f} loss_rot={lr0.item():.6f}")
+
+    abs_angle_t.requires_grad_(False)
+    opt_shift = torch.optim.Adam([abs_xy], lr=peak_lr)
+    for step in tqdm.tqdm(range(n_phase), desc="shifts"):
+        opt_shift.zero_grad()
+        for g in opt_shift.param_groups:
+            g["lr"] = lr_schedule(step, n_phase)
+        loss_shift, _ = loss_fn()
+        loss_shift.backward()
+        opt_shift.step()
+
+    with torch.no_grad():
+        ls1, lr1 = loss_fn()
+    print(f"  exp={exposure_time}: final   loss_shift={ls1.item():.6f} loss_rot={lr1.item():.6f}")
+    return ls1.item(), lr1.item(), abs_xy.detach(), abs_angle_t.detach()
+
+
+def run_group(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, warmup_frac=0.1):
+    abs_xy, abs_angle_t = _initial_pose_estimate(n, reg_exp, device)
 
     pairs = list(reg_exp.keys())
     reg_shift_i = torch.tensor([reg_exp[(i, j)][0] for (i, j) in pairs], dtype=torch.float32, device=device)
@@ -195,38 +236,7 @@ def run_group(exposure_time, n, reg_exp, device, n_iter=100_000, peak_lr=1e-3, w
         return 0.5 * peak_lr * (1 + math.cos(math.pi * min(1.0, progress)))
 
     n_phase = 50_000
-    with torch.no_grad():
-        ls0, lr0 = loss_fn()
-    print(f"\n  exp={exposure_time}: initial loss_shift={ls0.item():.6f} loss_rot={lr0.item():.6f}")
-
-    if lr0 > 0.0:
-        opt_rot = torch.optim.Adam([abs_angle_t], lr=peak_lr)
-        for step in tqdm.tqdm(range(n_phase), desc="angles"):
-            opt_rot.zero_grad()
-            for g in opt_rot.param_groups:
-                g["lr"] = lr_schedule(step, n_phase)
-            _, loss_rot = loss_fn()
-            loss_rot.backward()
-            opt_rot.step()
-
-        with torch.no_grad():
-            ls0, lr0 = loss_fn()
-        print(f"  exp={exposure_time}: phase1 loss_shift={ls0.item():.6f} loss_rot={lr0.item():.6f}")
-
-    abs_angle_t.requires_grad_(False)
-    opt_shift = torch.optim.Adam([abs_xy], lr=peak_lr)
-    for step in tqdm.tqdm(range(n_phase), desc="shifts"):
-        opt_shift.zero_grad()
-        for g in opt_shift.param_groups:
-            g["lr"] = lr_schedule(step, n_phase)
-        loss_shift, _ = loss_fn()
-        loss_shift.backward()
-        opt_shift.step()
-
-    with torch.no_grad():
-        ls1, lr1 = loss_fn()
-    print(f"  exp={exposure_time}: final   loss_shift={ls1.item():.6f} loss_rot={lr1.item():.6f}")
-    return ls1.item(), lr1.item(), abs_xy.detach(), abs_angle_t.detach()
+    return _run_optimizer_phases(loss_fn, lr_schedule, abs_xy, abs_angle_t, exposure_time, peak_lr, n_phase)
 
 
 def stage1_load(eda00_pkl: Path):

@@ -663,38 +663,14 @@ def symlink_and_display_clickable(ctx: Stage3Context, filename: str) -> None:
     )
 
 
-def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
-    """Refine moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1])."""
-    assert ctx.composite_crop is not None
-    device = ctx.device
-    dtype = torch.float64
-    composite_crop = ctx.composite_crop
-    H_crop, W_crop = ctx.H_crop, ctx.W_crop
-    mi_crop, mj_crop = ctx.mi_crop, ctx.mj_crop
-
-    img_rgb = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float32).unsqueeze(-1).expand(-1, -1, 3)
-    mi_crop, mj_crop, moon_r = find_moon(img_rgb, float(mi_crop), float(mj_crop))
-    ctx.mi_crop, ctx.mj_crop, ctx.moon_r = float(mi_crop), float(mj_crop), float(moon_r)
-
-    ii = np.arange(H_crop, dtype=np.float64).reshape(-1, 1)
-    jj = np.arange(W_crop, dtype=np.float64).reshape(1, -1)
-    dist_sq = (ii - mi_crop) ** 2 + (jj - mj_crop) ** 2
-    ctx.moon_mask = dist_sq <= (moon_r**2)
-
-    img = torch.from_numpy(composite_crop).to(device=device, dtype=dtype)
-    center = (float(mi_crop), float(mj_crop))
-    radius_min = 0.0
-    radius_max = _dist_to_corners(mi_crop, mj_crop, H_crop, W_crop)
-    n_r = max(int(math.ceil(2 * (radius_max - radius_min))) + 1, 2)
-    n_theta = max(int(math.ceil(4 * math.pi * radius_max)) + 1, 2)
-
+def _polar_transform_and_extrapolate(img, center, radius_min, radius_max, n_r, n_theta):
+    """Polar-transform img; fill invalid pixels via linear fit from the innermost valid rows."""
+    dtype = img.dtype
     polar_img, valid = cartesian_to_polar(img, center, radius_min, radius_max, n_r, n_theta, mask_margin=2)
     valid = valid.to(dtype=dtype)
     polar_img = polar_img.clone()
     valid = valid.clone()
 
-    # extrapolate data into the polar image pixels which are not covered by source image
-    # (we need this because we will do radial normalization)
     row_all = valid.bool().all(dim=1)
     if not bool(row_all.any().item()):
         raise AssertionError("polar extrapolation: no fully valid row")
@@ -732,11 +708,16 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
         row = sol[0, 0] * frow + sol[1, 0]
         polar_img[i, :][~m[i, :]] = row[~m[i, :]]
         valid_for_mean[i, :] = 1
-    # end of extrapolation magic
+    return polar_img, valid_for_mean, valid
 
+
+def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_max, n_r, n_theta):
+    """Sliding-window polar mean → piecewise-linear tone map; average over two angular window sizes."""
+    device = img.device
+    dtype = img.dtype
+    H_crop, W_crop = img.shape[:2]
     display_ts = []
-    row_fractions = [0.15, 1.0]
-    for row_fraction in row_fractions:
+    for row_fraction in [0.15, 1.0]:
         n_cols_use = max(1, int(n_theta * row_fraction))
         half_window = n_cols_use // 2
         polar_ext = torch.cat([polar_img, polar_img, polar_img], dim=1)
@@ -775,8 +756,12 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
         )
         display_t[valid_mask] = torch.where(mask3, torch.ones_like(v), display_t[valid_mask])
         display_ts.append(display_t)
-    display_t = torch.stack(display_ts).mean(dim=0)
+    return torch.stack(display_ts).mean(dim=0)
 
+
+def _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n_theta):
+    """Per-row radial p3 quantile in polar space → stretch [p3, 1] → [0, 1]."""
+    H_crop, W_crop = display_t.shape[:2]
     polar_display, _ = cartesian_to_polar(display_t, center, radius_min, radius_max, n_r, n_theta, mask_margin=2)
     blur = torchvision.transforms.GaussianBlur(kernel_size=13, sigma=5)
     valid_blur = blur(valid.float().unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0) > 0.9
@@ -784,15 +769,43 @@ def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
     q = torch.linspace(
         start=0.03, end=0.0001, steps=polar_display.shape[0], device=polar_display.device, dtype=polar_display.dtype
     )
-    p3_row = polar_display.quantile(q=q, dim=1)
-    p3_row = p3_row.diag()
+    p3_row = polar_display.quantile(q=q, dim=1).diag()
     p3_smooth = _vertical_gaussian_blur(p3_row.unsqueeze(1), kernel_size=133, sigma=33).squeeze(1)
     p3_polar_2d = p3_smooth.unsqueeze(1).expand(n_r, n_theta)
-    p3_at = polar_to_cartesian(p3_polar_2d, center, radius_min, radius_max, H_crop, W_crop)
-    p3_at = torch.nan_to_num(p3_at, nan=0.0)
-
+    p3_at = torch.nan_to_num(
+        polar_to_cartesian(p3_polar_2d, center, radius_min, radius_max, H_crop, W_crop), nan=0.0
+    )
     span = (1.0 - p3_at).clamp(min=1e-9)
-    display_t = ((display_t - p3_at) / span).clamp(0.0, 1.0)
+    return ((display_t - p3_at) / span).clamp(0.0, 1.0)
+
+
+def stage3_radial_normalize_display(ctx: Stage3Context) -> None:
+    """Refine moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1])."""
+    assert ctx.composite_crop is not None
+    device = ctx.device
+    composite_crop = ctx.composite_crop
+    H_crop, W_crop = ctx.H_crop, ctx.W_crop
+    mi_crop, mj_crop = ctx.mi_crop, ctx.mj_crop
+
+    img_rgb = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float32).unsqueeze(-1).expand(-1, -1, 3)
+    mi_crop, mj_crop, moon_r = find_moon(img_rgb, float(mi_crop), float(mj_crop))
+    ctx.mi_crop, ctx.mj_crop, ctx.moon_r = float(mi_crop), float(mj_crop), float(moon_r)
+
+    ii = np.arange(H_crop, dtype=np.float64).reshape(-1, 1)
+    jj = np.arange(W_crop, dtype=np.float64).reshape(1, -1)
+    dist_sq = (ii - mi_crop) ** 2 + (jj - mj_crop) ** 2
+    ctx.moon_mask = dist_sq <= (moon_r**2)
+
+    img = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float64)
+    center = (float(mi_crop), float(mj_crop))
+    radius_min = 0.0
+    radius_max = _dist_to_corners(mi_crop, mj_crop, H_crop, W_crop)
+    n_r = max(int(math.ceil(2 * (radius_max - radius_min))) + 1, 2)
+    n_theta = max(int(math.ceil(4 * math.pi * radius_max)) + 1, 2)
+
+    polar_img, valid_for_mean, valid = _polar_transform_and_extrapolate(img, center, radius_min, radius_max, n_r, n_theta)
+    display_t = _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_max, n_r, n_theta)
+    display_t = _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n_theta)
 
     ctx.display = display_t.cpu().numpy()
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
