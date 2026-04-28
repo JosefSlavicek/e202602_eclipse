@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import html
 import itertools
 import math
-import re
 import pickle
 import random
 from collections import Counter
@@ -18,8 +16,6 @@ import tqdm
 import eclipse_v1.stage0  # noqa: F401 — pickle loads ImageInfo from this module
 
 from PIL import Image
-from IPython.display import HTML, display
-import os
 
 from eclipse_v1.utils import load_grayscale, apply_transform_single, compute_weighted_average, compose_transforms
 
@@ -341,98 +337,3 @@ def run(eda00_pkl: Path, out_pkl: Path, debug_img_dir: Path) -> Path:
     prune_groups(exposure_groups, reg)
     opt_results = optimize_poses_and_debug(exposure_groups, reg, device, debug_img_dir)
     return save_pickle(out_pkl, exposure_groups, reg, opt_results)
-
-
-# Strict: v1-eda02_debugimg_<exposure>_anim.gif (exposure substring used in captions as-is)
-_EDA02_DEBUG_ANIM_STRICT = re.compile(r"^v1-eda02_debugimg_(.+)_anim\.gif$")
-
-
-def _rel_href_for_notebook(path: Path) -> str:
-    path = path.resolve()
-    cwd = Path.cwd().resolve()
-    try:
-        rel = path.relative_to(cwd)
-    except ValueError:
-        rel = Path(path.name)
-    s = rel.as_posix()
-    if not s.startswith(("./", "/")):
-        s = "./" + s
-    return s
-
-
-def symlink_eda02_debug_anim_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:
-    """
-    For each strict-match `v1-eda02_debugimg_*_anim.gif` under `workdir`, create a symlink in
-    `link_dir` (default: cwd) with the same basename, pointing at the resolved source file.
-    Removes an existing file or symlink at the destination before creating the link.
-    """
-    workdir = Path(workdir)
-    link_dir = Path.cwd() if link_dir is None else Path(link_dir)
-    link_dir.mkdir(parents=True, exist_ok=True)
-    created: list[Path] = []
-    for src in sorted(workdir.glob("v1-eda02_debugimg*_anim.gif"), key=lambda p: p.name):
-        if not _EDA02_DEBUG_ANIM_STRICT.match(src.name):
-            continue
-        if not src.is_file():
-            continue
-        dst = link_dir / src.name
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
-        dst.symlink_to(src.resolve())
-        created.append(dst)
-    return created
-
-
-def display_clickable_eda02_debug_img_grid(columns: int = 8, width: int = 128, gif_dir: Path | None = None) -> None:
-    """
-    Show strict-match `v1-eda02_debugimg_*_anim.gif` under `gif_dir` (default: cwd) in a table
-    with `columns` columns, lexicographic order by filename. Each cell is a clickable thumbnail
-    like `display_clickable_img`, with caption ``Exposure <substring> s`` from the filename.
-    """
-    gif_dir = Path.cwd() if gif_dir is None else Path(gif_dir)
-    rows_html: list[str] = []
-    chunk: list[tuple[Path, str]] = []
-    for p in sorted(gif_dir.glob("v1-eda02_debugimg*_anim.gif"), key=lambda q: q.name):
-        m = _EDA02_DEBUG_ANIM_STRICT.match(p.name)
-        if not m:
-            continue
-        chunk.append((p, m.group(1)))
-    if not chunk:
-        display(HTML("<p><em>No strict-match v1-eda02_debugimg_*_anim.gif files found.</em></p>"))
-        return
-    for i in range(0, len(chunk), columns):
-        row_cells: list[str] = []
-        for p, exposure in chunk[i : i + columns]:
-            href = html.escape(_rel_href_for_notebook(p), quote=True)
-            cap = html.escape(f"Exposure {exposure} s", quote=False)
-            row_cells.append(
-                "<td style=\"vertical-align:top; text-align:center; padding:6px;\">"
-                f'<a href="{href}" target="_blank">'
-                f'<img src="{href}" style="width:{int(width)}px; border:1px solid #ccc; border-radius:5px;">'
-                "</a>"
-                f'<p style="margin:4px 0 0 0;"><small>{cap}</small></p>'
-                "</td>"
-            )
-        rows_html.append("<tr>" + "".join(row_cells) + "</tr>")
-    table_html = (
-        '<table style="border-collapse:collapse;">'
-        + "".join(rows_html)
-        + "</table>"
-    )
-    display(HTML(table_html))
-
-
-def display_clickable_img(img_path, width=200):
-    """
-    Generates a clickable thumbnail.
-    img_path: Relative path to the image
-    width: Display width of the thumbnail in the notebook
-    """
-    # Wrap the image in an anchor tag pointing to itself
-    html_code = f'''
-    <a href="{img_path}" target="_blank">
-        <img src="{img_path}" style="width:{width}px; border:1px solid #ccc; border-radius:5px;">
-    </a>
-    <p><small>Source: {img_path}</small></p>
-    '''
-    display(HTML(html_code))

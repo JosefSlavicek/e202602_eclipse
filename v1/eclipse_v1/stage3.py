@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import html
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +18,6 @@ import torchvision
 import tqdm
 from PIL import Image
 from scipy.ndimage import gaussian_filter
-from IPython.display import HTML, display
 
 import eclipse_v1.stage0  # noqa: F401
 from eclipse_v1.stage0 import find_moon
@@ -52,36 +50,36 @@ def count_fft_patch_placements(height: int, width: int) -> tuple[int, int, int]:
 class Stage3Context:
     """Mutable state passed through stepped stage-3 functions (notebooks) or `run` (one-shot)."""
 
-    workdir: Path
-    device: torch.device = field(default_factory=lambda: torch.device("cuda"))
-    exposure_groups: Any = None
-    reg: Any = None
-    opt_results: Any = None
-    cross_reg: Any = None
-    gamma_by_pair: Any = None
-    exposure_times_sorted: list[Any] = field(default_factory=list)
-    t_ref: Any = None
-    moon_ref: tuple[float, float, float] | None = None
-    avg_images: dict[Any, torch.Tensor] = field(default_factory=dict)
-    avg_masks: dict[Any, torch.Tensor] = field(default_factory=dict)
-    H_ref: int = 0
-    W_ref: int = 0
-    composite: Optional[np.ndarray] = None
-    valid_all: Optional[np.ndarray] = None
-    r_lo: int = 0
-    r_hi: int = 0
-    c_lo: int = 0
-    c_hi: int = 0
-    composite_crop: Optional[np.ndarray] = None
-    mi_crop: float = 0.0
-    mj_crop: float = 0.0
-    moon_r: float = 0.0
-    moon_mask: Optional[np.ndarray] = None
-    H_crop: int = 0
-    W_crop: int = 0
-    display: Optional[np.ndarray] = None
-    sharpened_fft_diff: Optional[np.ndarray] = None
-    display_rgb: Optional[np.ndarray] = None
+    workdir: Path                                              # root output directory; set at construction
+    device: torch.device = field(default_factory=lambda: torch.device("cuda"))  # CUDA device; set at construction
+    exposure_groups: Any = None                                # exposure_time -> [ImageInfo]; loaded by load_inputs
+    reg: Any = None                                            # pairwise intra-exposure registration dict from stage0; loaded by load_inputs
+    opt_results: Any = None                                    # per-exposure pose optimization (abs_xy, abs_angle_t) from stage1; loaded by load_inputs
+    cross_reg: Any = None                                      # (t0,t1) -> (shift_i, shift_j, rotation) cross-exposure reg from stage2; loaded by load_inputs
+    gamma_by_pair: Any = None                                  # (t0,t1) -> gamma brightness scaling from stage2; loaded by load_inputs
+    exposure_times_sorted: list[Any] = field(default_factory=list)  # sorted exposure times (shortest two dropped); set by load_inputs
+    t_ref: Any = None                                          # reference exposure time (shortest kept); set by load_inputs
+    moon_ref: tuple[float, float, float] | None = None         # (i, j, radius) median moon in reference exposure; set by load_inputs
+    avg_images: dict[Any, torch.Tensor] = field(default_factory=dict)  # exp -> full-res per-exposure average tensor; set by build_per_exposure_averages
+    avg_masks: dict[Any, torch.Tensor] = field(default_factory=dict)   # exp -> valid-pixel mask tensor; set by build_per_exposure_averages
+    H_ref: int = 0                                             # pixel height of the reference image; set by build_per_exposure_averages
+    W_ref: int = 0                                             # pixel width of the reference image; set by build_per_exposure_averages
+    composite: Optional[np.ndarray] = None                     # weighted merge of all exposures in ref coords (float64); set by warp_merge_to_composite, freed after crop_and_save_composite
+    valid_all: Optional[np.ndarray] = None                     # minimum valid coverage map across exposures; set by warp_merge_to_composite
+    r_lo: int = 0                                              # top crop row (mutual-coverage boundary + 16 px margin); set by crop_and_save_composite
+    r_hi: int = 0                                              # bottom crop row; set by crop_and_save_composite
+    c_lo: int = 0                                              # left crop column; set by crop_and_save_composite
+    c_hi: int = 0                                              # right crop column; set by crop_and_save_composite
+    composite_crop: Optional[np.ndarray] = None                # composite sliced to crop bounds (float64); set by crop_and_save_composite
+    mi_crop: float = 0.0                                       # moon center row in crop coordinates; set by crop_and_save_composite, refined by radial_normalize_display
+    mj_crop: float = 0.0                                       # moon center column in crop coordinates; set by crop_and_save_composite, refined by radial_normalize_display
+    moon_r: float = 0.0                                        # moon radius in pixels; set by crop_and_save_composite, refined by radial_normalize_display
+    moon_mask: Optional[np.ndarray] = None                     # boolean mask of pixels inside the moon disk; set by radial_normalize_display
+    H_crop: int = 0                                            # pixel height of composite_crop; set by crop_and_save_composite
+    W_crop: int = 0                                            # pixel width of composite_crop; set by crop_and_save_composite
+    display: Optional[np.ndarray] = None                       # radially tone-mapped grayscale image in [0,1]; set by radial_normalize_display
+    sharpened_fft_diff: Optional[np.ndarray] = None            # display + FFT-smoothed unsharp signal, moon zeroed; set by fft_unsharp_and_save
+    display_rgb: Optional[np.ndarray] = None                   # RGB image with vignette, ready for export; set by rgb_vignette_and_radial_pickle
 
 
 def _ref_to_source_grid(H, W, chain_tuples, device):
@@ -638,30 +636,6 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     ctx.mi_crop = float(mi_crop)
     ctx.mj_crop = float(mj_crop)
     ctx.moon_r = float(moon_r0)
-
-
-def _rel_href_for_notebook(p: Path) -> str:
-    rel = p.relative_to(Path.cwd()) if p.is_absolute() else p
-    s = rel.as_posix()
-    if not s.startswith(("./", "/")):
-        s = "./" + s
-    return s
-
-
-def symlink_and_display_clickable(ctx: Stage3Context, filename: str) -> None:
-    src = ctx.workdir / filename
-    dst = Path.cwd() / filename
-    if dst.exists() or dst.is_symlink():
-        dst.unlink()
-    dst.symlink_to(src.resolve())
-    href = html.escape(_rel_href_for_notebook(dst), quote=True)
-    display(
-        HTML(
-            f'<a href="{href}" target="_blank">'
-            f'<img src="{href}" style="width:256px; border:1px solid #ccc; border-radius:5px;">'
-            "</a>"
-        )
-    )
 
 
 def _polar_transform_and_extrapolate(img, center, radius_min, radius_max, n_r, n_theta):
