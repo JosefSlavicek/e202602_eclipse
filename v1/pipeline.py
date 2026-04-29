@@ -33,89 +33,86 @@ from eclipse_v1.stage3 import (
     warp_merge_to_composite,
 )
 
-configure_cuda_visible_devices()
-require_cuda()
+if __name__ == "__main__":
+    configure_cuda_visible_devices()
+    require_cuda()
 
-DATA_ROOT = Path(os.environ.get("EDA00_DATA_ROOT", "/home/slavik/e202602_eclipse/data"))
-WORKDIR = Path(os.environ.get("ECLIPSE_V1_WORKDIR", "/home/slavik/tmp/eclipse_v1_run"))
-WORKDIR.mkdir(parents=True, exist_ok=True)
+    DATA_ROOT = Path(os.environ.get("EDA00_DATA_ROOT", "/home/slavik/e202602_eclipse/data"))
+    WORKDIR = Path(os.environ.get("ECLIPSE_V1_WORKDIR", "/home/slavik/tmp/eclipse_v1_run"))
+    WORKDIR.mkdir(parents=True, exist_ok=True)
 
-PK_EDA00 = WORKDIR / "v1-eda00.pkl"
-PK_EDA02 = WORKDIR / "v1-eda02.pkl"
-PK_EDA03 = WORKDIR / "v1-eda03.pkl"
+    PK_EDA00 = WORKDIR / "v1-eda00.pkl"
+    PK_EDA02 = WORKDIR / "v1-eda02.pkl"
+    PK_EDA03 = WORKDIR / "v1-eda03.pkl"
 
-device = torch.device("cuda")
+    device = torch.device("cuda")
 
+    # --- Stage 0 ---
 
-# --- Stage 0 ---
+    print("=== Stage 0: ingest, moon detection, intra-exposure registration ===")
 
-print("=== Stage 0: ingest, moon detection, intra-exposure registration ===")
+    image_infos = s0.get_image_infos(DATA_ROOT)
+    print(f"Found {len(image_infos)} images, first: {image_infos[0].path}")
 
-image_infos = s0.get_image_infos(DATA_ROOT)
-print(f"Found {len(image_infos)} images, first: {image_infos[0].path}")
+    exposure_groups = s0.group_by_exposure(image_infos)
 
-exposure_groups = s0.group_by_exposure(image_infos)
+    s0.detect_moons(image_infos)
+    print("Exposure groups after moon detection:")
+    s0.print_exposure_groups_stats(exposure_groups)
 
-s0.detect_moons(image_infos)
-print("Exposure groups after moon detection:")
-s0.print_exposure_groups_stats(exposure_groups)
+    print("Pruning failed moon estimations")
+    s0.prune_moon_info_for_radius_outliers(exposure_groups)
 
-print("Pruning failed moon estimations")
-s0.prune_moon_info_for_radius_outliers(exposure_groups)
+    interp = s0.interpolate_missing_moons(image_infos, exposure_groups)
+    s0.set_moon_position_std(image_infos, exposure_groups, interp)
 
-interp = s0.interpolate_missing_moons(image_infos, exposure_groups)
-s0.set_moon_position_std(image_infos, exposure_groups, interp)
+    reg = s0.register_intra_exposure_pairs(exposure_groups)
+    s0.save_pickle(exposure_groups, reg, PK_EDA00)
+    print(f"Stage 0 done → {PK_EDA00}")
 
-reg = s0.register_intra_exposure_pairs(exposure_groups)
-s0.save_pickle(exposure_groups, reg, PK_EDA00)
-print(f"Stage 0 done → {PK_EDA00}")
+    # --- Stage 1 ---
 
+    print("\n=== Stage 1: prune stacks, global pose fit per exposure ===")
 
-# --- Stage 1 ---
+    exposure_groups, reg = s1.load(PK_EDA00)
+    s1.prune_groups(exposure_groups, reg)
 
-print("\n=== Stage 1: prune stacks, global pose fit per exposure ===")
+    opt_results = s1.optimize_poses_and_debug(
+        exposure_groups, reg, device, debug_img_dir=WORKDIR
+    )
 
-exposure_groups, reg = s1.load(PK_EDA00)
-s1.prune_groups(exposure_groups, reg)
+    s1.save_pickle(PK_EDA02, exposure_groups, reg, opt_results)
+    print(f"Stage 1 done → {PK_EDA02}")
 
-opt_results = s1.optimize_poses_and_debug(
-    exposure_groups, reg, device, debug_img_dir=WORKDIR
-)
+    # --- Stage 2 ---
 
-s1.save_pickle(PK_EDA02, exposure_groups, reg, opt_results)
-print(f"Stage 1 done → {PK_EDA02}")
+    print("\n=== Stage 2: full-res stack means, cross-exposure chain ===")
 
+    exposure_groups, _reg, opt_results = s2.load(PK_EDA02)
+    moon_by_exp, exposure_times_sorted = s2.moon_median_table(exposure_groups)
 
-# --- Stage 2 ---
+    avg_images = s2.fullsize_averages(
+        exposure_groups, exposure_times_sorted, opt_results, device
+    )
 
-print("\n=== Stage 2: full-res stack means, cross-exposure chain ===")
+    pairs_results = s2.cross_exposure_consecutive_pairs(
+        exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir=WORKDIR
+    )
 
-exposure_groups, _reg, opt_results = s2.load(PK_EDA02)
-moon_by_exp, exposure_times_sorted = s2.moon_median_table(exposure_groups)
+    s2.save_pickle(PK_EDA03, pairs_results)
+    print(f"Stage 2 done → {PK_EDA03}")
 
-avg_images = s2.fullsize_averages(
-    exposure_groups, exposure_times_sorted, opt_results, device
-)
+    # --- Stage 3 ---
 
-pairs_results = s2.cross_exposure_consecutive_pairs(
-    exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir=WORKDIR
-)
+    print("\n=== Stage 3: reference merge, radial tone, FFT sharpen, RGB ===")
 
-s2.save_pickle(PK_EDA03, pairs_results)
-print(f"Stage 2 done → {PK_EDA03}")
+    ctx = Stage3Context(workdir=WORKDIR)
+    load_inputs(ctx)
+    build_per_exposure_averages(ctx)
+    warp_merge_to_composite(ctx)
+    crop_and_save_composite(ctx)
+    radial_normalize_display(ctx)
+    fft_unsharp_and_save(ctx)
+    rgb_vignette_and_radial_pickle(ctx)
 
-
-# --- Stage 3 ---
-
-print("\n=== Stage 3: reference merge, radial tone, FFT sharpen, RGB ===")
-
-ctx = Stage3Context(workdir=WORKDIR)
-load_inputs(ctx)
-build_per_exposure_averages(ctx)
-warp_merge_to_composite(ctx)
-crop_and_save_composite(ctx)
-radial_normalize_display(ctx)
-fft_unsharp_and_save(ctx)
-rgb_vignette_and_radial_pickle(ctx)
-
-print("\nPipeline complete. Outputs in", WORKDIR)
+    print("\nPipeline complete. Outputs in", WORKDIR)
