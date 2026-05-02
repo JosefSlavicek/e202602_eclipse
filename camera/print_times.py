@@ -5,6 +5,10 @@ from collections import defaultdict
 def get_exposure_time(file_path):
     with open(file_path, 'rb') as f:
         tags = exifread.process_file(f, details=False)
+        aperture = tags['EXIF FNumber']
+        aperture_val = aperture.values[0]
+        assert float(aperture_val.num) / float(aperture_val.den) == 4.5, \
+            f"{file_path}: expected aperture 4.5, got {float(aperture_val.num) / float(aperture_val.den)}"
         exposure = tags.get('EXIF ExposureTime')
         if exposure:
             val = exposure.values[0]
