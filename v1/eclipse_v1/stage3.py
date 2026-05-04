@@ -1,4 +1,4 @@
-"""Stage 3: composite merge, radial processing, sharpen, RGB (eda05)."""
+"""Stage 3: composite merge, radial processing, sharpen, RGB."""
 from __future__ import annotations
 
 import math
@@ -480,12 +480,12 @@ def _sliding_diff_smooth_for_sigma(
 
 
 def load_inputs(ctx: Stage3Context) -> None:
-    """Load eda02/eda03 pickles; set exposure list, reference exposure, and moon prior."""
-    with open(ctx.workdir / "v1-eda02.pkl", "rb") as fd:
+    """Load stage1/stage2 pickles; set exposure list, reference exposure, and moon prior."""
+    with open(ctx.workdir / "v1-stage1.pkl", "rb") as fd:
         ctx.exposure_groups = pickle.load(fd)
         ctx.reg = pickle.load(fd)
         ctx.opt_results = pickle.load(fd)
-    with open(ctx.workdir / "v1-eda03.pkl", "rb") as fd:
+    with open(ctx.workdir / "v1-stage2.pkl", "rb") as fd:
         ctx.cross_reg = pickle.load(fd)
         ctx.gamma_by_pair = pickle.load(fd)
     ctx.device = torch.device("cuda")
@@ -619,7 +619,7 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     dist_sq = (ii - mi_crop) ** 2 + (jj - mj_crop) ** 2
     moon_mask_preview = dist_sq <= (moon_r0**2)
 
-    np.save(out_dir / "v1-eda05_composite.npy", composite_crop)
+    np.save(out_dir / "v1-stage3_composite.npy", composite_crop)
     v_min = np.percentile(
         composite_crop[~moon_mask_preview] if np.any(~moon_mask_preview) else composite_crop, 1
     )
@@ -628,9 +628,9 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     )
     preview = np.clip((composite_crop - v_min) / (v_max - v_min + 1e-9), 0, 1)
     Image.fromarray((preview * 255).clip(0, 255).astype(np.uint8)).save(
-        out_dir / "v1-eda05_composite_preview.png"
+        out_dir / "v1-stage3_composite_preview.png"
     )
-    print(f"Saved {out_dir / 'v1-eda05_composite.npy'} (float64), {out_dir / 'v1-eda05_composite_preview.png'}")
+    print(f"Saved {out_dir / 'v1-stage3_composite.npy'} (float64), {out_dir / 'v1-stage3_composite_preview.png'}")
 
     ctx.composite_crop = composite_crop
     ctx.mi_crop = float(mi_crop)
@@ -789,9 +789,9 @@ def radial_normalize_display(ctx: Stage3Context) -> None:
     plt.tight_layout()
     plt.close(fig)
     Image.fromarray((ctx.display * 255).clip(0, 255).astype(np.uint8)).save(
-        ctx.workdir / "v1-eda05_radial_normalize.png"
+        ctx.workdir / "v1-stage3_radial_normalize.png"
     )
-    print(f"Saved {ctx.workdir / 'v1-eda05_radial_normalize.png'}")
+    print(f"Saved {ctx.workdir / 'v1-stage3_radial_normalize.png'}")
 
 
 def fft_unsharp_and_save(ctx: Stage3Context) -> None:
@@ -823,7 +823,7 @@ def fft_unsharp_and_save(ctx: Stage3Context) -> None:
     sharpened[ctx.moon_mask] = 0.0
     ctx.sharpened_fft_diff = sharpened
 
-    out_png = ctx.workdir / "v1-eda05_radial_normalize_sharpen_fft_smoothed_diff.png"
+    out_png = ctx.workdir / "v1-stage3_radial_normalize_sharpen_fft_smoothed_diff.png"
     Image.fromarray((sharpened * 255).clip(0, 255).astype(np.uint8)).save(out_png)
     vlim_ds = float(np.percentile(np.abs(combined_diff), 99.0))
     vlim_ds = max(vlim_ds, 1e-9)
@@ -833,14 +833,14 @@ def fft_unsharp_and_save(ctx: Stage3Context) -> None:
         f"Combined FFT-smoothed diff: {strength_r2}*D(s=2)+{strength_r4}*D(s=4)+{strength_r8}*D(s=8)"
     )
     axes[1].imshow(sharpened, cmap="gray", vmin=0, vmax=1)
-    axes[1].set_title("eda05 unsharp: display + combined diff")
+    axes[1].set_title("stage3 unsharp: display + combined diff")
     plt.tight_layout()
     plt.close(fig)
     print(f"Saved {out_png}")
 
 
 def rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
-    """RGB + vignette PNG and v1-eda05_radial.pkl sidecar."""
+    """RGB + vignette PNG and v1-stage3_radial.pkl sidecar."""
     assert ctx.sharpened_fft_diff is not None and ctx.moon_mask is not None #and ctx.p3_at is not None
     gray = np.clip(ctx.sharpened_fft_diff.astype(np.float64), 0.0, 1.0)
     R = gray
@@ -874,13 +874,13 @@ def rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     plt.tight_layout()
     plt.close(fig)
 
-    out_png = ctx.workdir / "v1-eda05_rgb_rescaled.png"
+    out_png = ctx.workdir / "v1-stage3_rgb_rescaled.png"
     Image.fromarray((display_rgb * 255).round().clip(0, 255).astype(np.uint8)).save(out_png)
     print(f"Saved {out_png}")
 
 
 def run(workdir: Path) -> None:
-    """Run full eda05 pipeline; writes v1-eda05_* artifacts under workdir."""
+    """Run full stage 3 pipeline; writes v1-stage3_* artifacts under workdir."""
     ctx = Stage3Context(workdir=workdir)
     load_inputs(ctx)
     build_per_exposure_averages(ctx)

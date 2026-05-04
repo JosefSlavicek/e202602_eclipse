@@ -41,9 +41,9 @@ def plot_exposure_group_thumbnails(exposure_groups: dict, thumb_width: int = 150
 
 # ----- Filename patterns ------------------------------------------------------
 
-_EDA02_DEBUG_ANIM_STRICT = re.compile(r"^v1-eda02_debugimg_(.+)_anim\.gif$")
-_EDA03_PAIR_STRICT = re.compile(
-    r'^v1-eda03_pair_(\d+\.\d+)_(\d+\.\d+)_gamma(\d+\.\d+)\.gif$'
+_STAGE1_DEBUG_ANIM_STRICT = re.compile(r"^v1-stage1_debugimg_(.+)_anim\.gif$")
+_STAGE2_PAIR_STRICT = re.compile(
+    r'^v1-stage2_pair_(\d+\.\d+)_(\d+\.\d+)_gamma(\d+\.\d+)\.gif$'
 )
 
 
@@ -64,9 +64,9 @@ def _rel_href_for_notebook(path: Path) -> str:
 
 # ----- Stage 1 display -------------------------------------------------------
 
-def symlink_eda02_debug_anim_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:
+def symlink_stage1_debug_anim_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:
     """
-    For each strict-match `v1-eda02_debugimg_*_anim.gif` under `workdir`, create a symlink in
+    For each strict-match `v1-stage1_debugimg_*_anim.gif` under `workdir`, create a symlink in
     `link_dir` (default: cwd) with the same basename, pointing at the resolved source file.
     Removes an existing file or symlink at the destination before creating the link.
     """
@@ -74,8 +74,8 @@ def symlink_eda02_debug_anim_gifs(workdir: Path, link_dir: Path | None = None) -
     link_dir = Path.cwd() if link_dir is None else Path(link_dir)
     link_dir.mkdir(parents=True, exist_ok=True)
     created: list[Path] = []
-    for src in sorted(workdir.glob("v1-eda02_debugimg*_anim.gif"), key=lambda p: p.name):
-        if not _EDA02_DEBUG_ANIM_STRICT.match(src.name):
+    for src in sorted(workdir.glob("v1-stage1_debugimg*_anim.gif"), key=lambda p: p.name):
+        if not _STAGE1_DEBUG_ANIM_STRICT.match(src.name):
             continue
         if not src.is_file():
             continue
@@ -87,21 +87,21 @@ def symlink_eda02_debug_anim_gifs(workdir: Path, link_dir: Path | None = None) -
     return created
 
 
-def display_clickable_eda02_debug_img_grid(columns: int = 8, width: int = 128, gif_dir: Path | None = None) -> None:
+def display_clickable_stage1_debug_img_grid(columns: int = 8, width: int = 128, gif_dir: Path | None = None) -> None:
     """
-    Show strict-match `v1-eda02_debugimg_*_anim.gif` under `gif_dir` (default: cwd) in a table
+    Show strict-match `v1-stage1_debugimg_*_anim.gif` under `gif_dir` (default: cwd) in a table
     with `columns` columns, lexicographic order by filename. Each cell is a clickable thumbnail
     like `display_clickable_img`, with caption ``Exposure <substring> s`` from the filename.
     """
     gif_dir = Path.cwd() if gif_dir is None else Path(gif_dir)
     chunk: list[tuple[Path, str]] = []
-    for p in sorted(gif_dir.glob("v1-eda02_debugimg*_anim.gif"), key=lambda q: q.name):
-        m = _EDA02_DEBUG_ANIM_STRICT.match(p.name)
+    for p in sorted(gif_dir.glob("v1-stage1_debugimg*_anim.gif"), key=lambda q: q.name):
+        m = _STAGE1_DEBUG_ANIM_STRICT.match(p.name)
         if not m:
             continue
         chunk.append((p, m.group(1)))
     if not chunk:
-        display(HTML("<p><em>No strict-match v1-eda02_debugimg_*_anim.gif files found.</em></p>"))
+        display(HTML("<p><em>No strict-match v1-stage1_debugimg_*_anim.gif files found.</em></p>"))
         return
     rows_html: list[str] = []
     for i in range(0, len(chunk), columns):
@@ -142,13 +142,13 @@ def display_clickable_img(img_path, width=200):
 
 # ----- Stage 2 display -------------------------------------------------------
 
-def symlink_eda03_pair_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:
+def symlink_stage2_pair_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:
     workdir = Path(workdir)
     link_dir = Path.cwd() if link_dir is None else Path(link_dir)
     link_dir.mkdir(parents=True, exist_ok=True)
     created: list[Path] = []
-    for src in sorted(workdir.glob("v1-eda03_pair*.gif"), key=lambda p: p.name):
-        if not _EDA03_PAIR_STRICT.match(src.name):
+    for src in sorted(workdir.glob("v1-stage2_pair*.gif"), key=lambda p: p.name):
+        if not _STAGE2_PAIR_STRICT.match(src.name):
             continue
         if not src.is_file():
             continue
@@ -160,19 +160,19 @@ def symlink_eda03_pair_gifs(workdir: Path, link_dir: Path | None = None) -> list
     return created
 
 
-def display_clickable_eda03_pair_gif_grid(
+def display_clickable_stage2_pair_gif_grid(
     columns: int = 8, width: int = 128, gif_dir: Path | None = None
 ) -> None:
     gif_dir = Path.cwd() if gif_dir is None else Path(gif_dir)
     chunk: list[tuple[Path, str]] = []
-    for p in sorted(gif_dir.glob("v1-eda03_pair*.gif"), key=lambda q: q.name):
-        m = _EDA03_PAIR_STRICT.match(p.name)
+    for p in sorted(gif_dir.glob("v1-stage2_pair*.gif"), key=lambda q: q.name):
+        m = _STAGE2_PAIR_STRICT.match(p.name)
         if not m:
             continue
         t0, t1, gamma = m.group(1), m.group(2), m.group(3)
         chunk.append((p, f"t0={t0} t1={t1} \u03b3={gamma}"))
     if not chunk:
-        display(HTML("<p><em>No strict-match v1-eda03_pair_*.gif files found.</em></p>"))
+        display(HTML("<p><em>No strict-match v1-stage2_pair_*.gif files found.</em></p>"))
         return
     rows_html: list[str] = []
     for i in range(0, len(chunk), columns):

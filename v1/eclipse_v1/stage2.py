@@ -1,4 +1,4 @@
-"""Stage 2: per-exposure averages + cross-exposure registration and gamma (eda03)."""
+"""Stage 2: per-exposure averages + cross-exposure registration and gamma."""
 
 from __future__ import annotations
 
@@ -88,9 +88,9 @@ def register_cross_exposure(img0, img1_scaled, moon0, moon1, gamma, t0, t1, devi
     return grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, apriori_valid=apriori_valid)
 
 
-def load(eda02_pkl: Path):
-    eda02_pkl = Path(eda02_pkl)
-    with open(eda02_pkl, "rb") as fd:
+def load(stage1_pkl: Path):
+    stage1_pkl = Path(stage1_pkl)
+    with open(stage1_pkl, "rb") as fd:
         exposure_groups = pickle.load(fd)
         reg = pickle.load(fd)
         opt_results = pickle.load(fd)
@@ -176,7 +176,7 @@ def cross_exposure_consecutive_pairs(
         pair_gif_dir.mkdir(parents=True, exist_ok=True)
         frame0 = Image.fromarray(np.stack([crop0, crop0, crop0], axis=-1))
         frame1 = Image.fromarray(np.stack([crop1, crop1, crop1], axis=-1))
-        gif_path = pair_gif_dir / f"v1-eda03_pair_{t0:.5f}_{t1:.5f}_gamma{gamma2:.4f}.gif"
+        gif_path = pair_gif_dir / f"v1-stage2_pair_{t0:.5f}_{t1:.5f}_gamma{gamma2:.4f}.gif"
         frame0.save(gif_path, save_all=True, append_images=[frame1], duration=500, loop=0)
 
         print(f"t0={t0:.5f} t1={t1:.5f} gamma={gamma2:.4f} -> {gif_path}")
@@ -196,12 +196,12 @@ def save_pickle(out_pkl: Path, pairs_results: list) -> Path:
     return out_pkl
 
 
-def run(eda02_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
+def run(stage1_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stage 2.")
     device = torch.device("cuda")
 
-    exposure_groups, _reg, opt_results = load(eda02_pkl)
+    exposure_groups, _reg, opt_results = load(stage1_pkl)
     moon_by_exp, exposure_times_sorted = moon_median_table(exposure_groups)
     avg_images = fullsize_averages(exposure_groups, exposure_times_sorted, opt_results, device)
     pairs_results = cross_exposure_consecutive_pairs(

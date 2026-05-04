@@ -41,9 +41,9 @@ if __name__ == "__main__":
     WORKDIR = Path(os.environ.get("ECLIPSE_V1_WORKDIR", "/home/slavik/tmp/eclipse_v1_run"))
     WORKDIR.mkdir(parents=True, exist_ok=True)
 
-    PK_EDA00 = WORKDIR / "v1-eda00.pkl"
-    PK_EDA02 = WORKDIR / "v1-eda02.pkl"
-    PK_EDA03 = WORKDIR / "v1-eda03.pkl"
+    PK_STAGE0 = WORKDIR / "v1-stage0.pkl"
+    PK_STAGE1 = WORKDIR / "v1-stage1.pkl"
+    PK_STAGE2 = WORKDIR / "v1-stage2.pkl"
 
     device = torch.device("cuda")
 
@@ -67,28 +67,28 @@ if __name__ == "__main__":
     s0.set_moon_position_std(image_infos, exposure_groups, interp)
 
     reg = s0.register_intra_exposure_pairs(exposure_groups)
-    s0.save_pickle(exposure_groups, reg, PK_EDA00)
-    print(f"Stage 0 done → {PK_EDA00}")
+    s0.save_pickle(exposure_groups, reg, PK_STAGE0)
+    print(f"Stage 0 done → {PK_STAGE0}")
 
     # --- Stage 1 ---
 
     print("\n=== Stage 1: prune stacks, global pose fit per exposure ===")
 
-    exposure_groups, reg = s1.load(PK_EDA00)
+    exposure_groups, reg = s1.load(PK_STAGE0)
     s1.prune_groups(exposure_groups, reg)
 
     opt_results = s1.optimize_poses_and_debug(
         exposure_groups, reg, device, debug_img_dir=WORKDIR
     )
 
-    s1.save_pickle(PK_EDA02, exposure_groups, reg, opt_results)
-    print(f"Stage 1 done → {PK_EDA02}")
+    s1.save_pickle(PK_STAGE1, exposure_groups, reg, opt_results)
+    print(f"Stage 1 done → {PK_STAGE1}")
 
     # --- Stage 2 ---
 
     print("\n=== Stage 2: full-res stack means, cross-exposure chain ===")
 
-    exposure_groups, _reg, opt_results = s2.load(PK_EDA02)
+    exposure_groups, _reg, opt_results = s2.load(PK_STAGE1)
     moon_by_exp, exposure_times_sorted = s2.moon_median_table(exposure_groups)
 
     avg_images = s2.fullsize_averages(
@@ -99,8 +99,8 @@ if __name__ == "__main__":
         exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir=WORKDIR
     )
 
-    s2.save_pickle(PK_EDA03, pairs_results)
-    print(f"Stage 2 done → {PK_EDA03}")
+    s2.save_pickle(PK_STAGE2, pairs_results)
+    print(f"Stage 2 done → {PK_STAGE2}")
 
     # --- Stage 3 ---
 

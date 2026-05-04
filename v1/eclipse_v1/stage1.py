@@ -1,4 +1,4 @@
-"""Stage 1: brightness + triplet pruning, per-exposure pose optimization (eda02)."""
+"""Stage 1: brightness + triplet pruning, per-exposure pose optimization."""
 
 from __future__ import annotations
 
@@ -237,9 +237,9 @@ def optimize_group_poses(exposure_time, n, reg_exp, device, n_iter=100_000, peak
     return _run_optimizer_phases(loss_fn, lr_schedule, abs_xy, abs_angle_t, exposure_time, peak_lr, N_PHASE)
 
 
-def load(eda00_pkl: Path):
+def load(stage0_pkl: Path):
     """Load stage-0 pickle: exposure_groups, pairwise reg (mutable reg dict for pruning)."""
-    with open(eda00_pkl, "rb") as fd:
+    with open(stage0_pkl, "rb") as fd:
         exposure_groups = pickle.load(fd)
         reg = pickle.load(fd)
     return exposure_groups, reg
@@ -300,14 +300,14 @@ def optimize_poses_and_debug(
         avg_img, _, warped_list = compute_weighted_average(group, abs_xy, abs_angle_t, device)
         crop_single = (img_single[i_lo:i_hi, j_lo:j_hi].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         crop_avg = (avg_img[i_lo:i_hi, j_lo:j_hi].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        Image.fromarray(crop_single).save(debug_img_dir / f"v1-eda02_debugimg_{exposure_time:.6f}_random.png")
-        Image.fromarray(crop_avg).save(debug_img_dir / f"v1-eda02_debugimg_{exposure_time:.6f}_average.png")
+        Image.fromarray(crop_single).save(debug_img_dir / f"v1-stage1_debugimg_{exposure_time:.6f}_random.png")
+        Image.fromarray(crop_avg).save(debug_img_dir / f"v1-stage1_debugimg_{exposure_time:.6f}_average.png")
         frames = []
         for w in warped_list:
             c = (w[i_lo:i_hi, j_lo:j_hi].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             frames.append(Image.fromarray(c))
         frames[0].save(
-            debug_img_dir / f"v1-eda02_debugimg_{exposure_time:.6f}_anim.gif",
+            debug_img_dir / f"v1-stage1_debugimg_{exposure_time:.6f}_anim.gif",
             save_all=True,
             append_images=frames[1:],
             duration=500,
@@ -328,12 +328,12 @@ def save_pickle(out_pkl: Path, exposure_groups, reg: dict, opt_results: dict) ->
     return out_pkl
 
 
-def run(eda00_pkl: Path, out_pkl: Path, debug_img_dir: Path) -> Path:
+def run(stage0_pkl: Path, out_pkl: Path, debug_img_dir: Path) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stage 1.")
     device = torch.device("cuda")
 
-    exposure_groups, reg = load(eda00_pkl)
+    exposure_groups, reg = load(stage0_pkl)
     prune_groups(exposure_groups, reg)
     opt_results = optimize_poses_and_debug(exposure_groups, reg, device, debug_img_dir)
     return save_pickle(out_pkl, exposure_groups, reg, opt_results)
