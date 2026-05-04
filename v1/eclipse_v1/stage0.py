@@ -86,23 +86,24 @@ def get_image_infos(data_root: str | Path):
         with Image.open(jpg_file) as img:
             width, height = img.size
             avg_brightness = np.array(img).astype(np.float32).mean() / 255.0
-            if BRIGHTNESS_MIN <= avg_brightness <= BRIGHTNESS_MAX:
-                exposure_time, timestamp = get_info_from_exif(jpg_file)
-                image_infos.append(
-                    ImageInfo(
-                        path=jpg_file,
-                        width=width,
-                        height=height,
-                        avg_brightness=avg_brightness,
-                        timestamp=timestamp,
-                        exposure_time=exposure_time,
-                    )
+            assert BRIGHTNESS_MIN <= avg_brightness <= BRIGHTNESS_MAX, (jpg_file, avg_brightness)
+            exposure_time, timestamp = get_info_from_exif(jpg_file)
+            image_infos.append(
+                ImageInfo(
+                    path=jpg_file,
+                    width=width,
+                    height=height,
+                    avg_brightness=avg_brightness,
+                    timestamp=timestamp,
+                    exposure_time=exposure_time,
                 )
+            )
     assert len(image_infos) > 0
     for ii in image_infos:
         assert ii.width == image_infos[0].width
         assert ii.height == image_infos[0].height
     image_infos.sort(key=lambda x: x.avg_brightness)
+    assert image_infos[-1].avg_brightness > 0.1, ('Suspiciously low brightness ... are we interpreting data correctly?', [ii.avg_brightness for ii in image_infos])
     return image_infos
 
 
