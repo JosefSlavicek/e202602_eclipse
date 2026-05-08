@@ -14,7 +14,6 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from datetime import datetime
 import exiftool
 import enum
-import torchvision
 import itertools
 import tqdm
 
@@ -228,7 +227,6 @@ class ApproxMoonFinder:
     _kernels = {}
     _min_radius = 3
     _target_size = 256
-    _max_radius = _target_size // 2 - 3
 
     @classmethod
     def _create_circle_kernel(cls, radius: int, device: torch.device):
@@ -264,90 +262,27 @@ class ApproxMoonFinder:
         gray_scaled = torch.nn.functional.interpolate(
             gray_4d, size=(H_scaled, W_scaled), mode="bilinear", align_corners=False
         ).squeeze()
-        pad_h = (cls._target_size - H_scaled) // 2
-        pad_w = (cls._target_size - W_scaled) // 2
-        gray_downscaled = torch.nn.functional.pad(
-            gray_scaled,
-            (
-                pad_w,
-                cls._target_size - W_scaled - pad_w,
-                pad_h,
-                cls._target_size - H_scaled - pad_h,
-            ),
-            mode="constant",
-            value=0.0,
-        )
-        H_down, W_down = gray_downscaled.shape
+        max_radius = min(H_scaled, W_scaled) // 2 - 3
         best_diff = torch.full(
-            (H_down, W_down), float("-inf"), device=device, dtype=torch.float32
+            (H_scaled, W_scaled), float("-inf"), device=device, dtype=torch.float32
         )
         sum_prev = sum_prev2 = None
-        for radius in range(cls._min_radius, cls._max_radius + 1):
+        gray_input = gray_scaled.unsqueeze(0).unsqueeze(0)
+        for radius in range(cls._min_radius, max_radius + 1):
             kernel = cls._get_kernel(radius, device)
-            padding = radius
-            gray_input = gray_downscaled.unsqueeze(0).unsqueeze(0)
             sum_along_circle = torch.nn.functional.conv2d(
-                gray_input, kernel, padding=padding
+                gray_input, kernel, padding=radius
             ).squeeze()
             if sum_prev2 is not None:
                 diff = sum_along_circle - sum_prev2
                 best_diff = torch.maximum(best_diff, diff)
             sum_prev2, sum_prev = sum_prev, sum_along_circle
         flat_idx = best_diff.argmax().item()
-        i_down = flat_idx // W_down
-        j_down = flat_idx % W_down
-        i_scaled = i_down - pad_h
-        j_scaled = j_down - pad_w
-        i = int(round((i_scaled + 0.5) * (original_H / H_scaled) - 0.5))
-        j = int(round((j_scaled + 0.5) * (original_W / W_scaled) - 0.5))
+        i_down = flat_idx // W_scaled
+        j_down = flat_idx % W_scaled
+        i = int(round((i_down + 0.5) * (original_H / H_scaled) - 0.5))
+        j = int(round((j_down + 0.5) * (original_W / W_scaled) - 0.5))
         return (i, j)
-
-
-def find_common_centers_and_radii(
-    moon_center_target, moon_radius_target, moon_centers_warped, moon_radius_warped
-):
-    centers = []
-    radii = []
-    for center2 in moon_centers_warped:
-        vector = (
-            center2[0] - moon_center_target[0],
-            center2[1] - moon_center_target[1],
-        )
-        distance = math.sqrt(vector[0] ** 2 + vector[1] ** 2)
-        if distance < 0.001:
-            center = center2
-            radius = max(moon_radius_target, moon_radius_warped)
-        else:
-            vector = (vector[0] / distance, vector[1] / distance)
-            pt_target = (
-                moon_center_target[0] - vector[0] * moon_radius_target,
-                moon_center_target[1] - vector[1] * moon_radius_target,
-            )
-            pt_warped = (
-                center2[0] + vector[0] * moon_radius_warped,
-                center2[1] + vector[1] * moon_radius_warped,
-            )
-            center = (
-                0.5 * (pt_target[0] + pt_warped[0]),
-                0.5 * (pt_target[1] + pt_warped[1]),
-            )
-            radius = 0.5 * (distance + moon_radius_target + moon_radius_warped)
-        centers.append(center)
-        radii.append(radius)
-    return centers, radii
-
-
-def find_max_radii(common_centers, height: int, width: int):
-    radii = []
-    for center in common_centers:
-        di = np.abs(center[0] - height / 2)
-        dj = np.abs(center[1] - width / 2)
-        ri = height / 2 - di
-        rj = width / 2 - dj
-        radius = min(ri, rj)
-        assert radius > 10, (center, height, width)
-        radii.append(radius)
-    return radii
 
 
 def register_equal_exposure(image_info0, image_info1):
@@ -372,10 +307,7 @@ def detect_moons(image_infos: list) -> None:
     for ii in tqdm.tqdm(image_infos, desc="Finding moon"):
         img = Image.open(ii.path)
         img_arr = torch.from_numpy(np.array(img).astype(np.float32) / 255.0).cuda()
-        if img_arr.ndim == 2:
-            img_arr = img_arr.unsqueeze(-1).expand(-1, -1, 3)
-        elif img_arr.shape[2] == 1:
-            img_arr = img_arr.expand(-1, -1, 3)
+        assert img_arr.ndim == 3 and img_arr.shape[-1] == 3, img_arr.shape
         i0, j0 = ApproxMoonFinder.find_moon_approx(img_arr)
         i, j, radius = find_moon(img_arr, i0, j0)
         ii.moon = (i, j, radius)

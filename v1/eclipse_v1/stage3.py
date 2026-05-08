@@ -36,16 +36,6 @@ VALID_THRESH = 0.9999
 RGB_DIM_QUOTIENTS = (0.25, 0.28, 0.37)
 
 
-def count_fft_patch_placements(height: int, width: int) -> tuple[int, int, int]:
-    """How many patch origins (row starts × col starts) the FFT sharpen scans; total per blur sigma."""
-    a, stride = PATCH_SIDE, PATCH_STRIDE
-    if height < a or width < a:
-        return 0, 0, 0
-    n_r = len(range(0, height - a + 1, stride))
-    n_c = len(range(0, width - a + 1, stride))
-    return n_r, n_c, n_r * n_c
-
-
 @dataclass
 class Stage3Context:
     """Mutable state passed through stepped stage-3 functions (notebooks) or `run` (one-shot)."""

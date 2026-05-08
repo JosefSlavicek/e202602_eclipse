@@ -125,21 +125,6 @@ def display_clickable_stage1_debug_img_grid(columns: int = 8, width: int = 128, 
     ))
 
 
-def display_clickable_img(img_path, width=200):
-    """
-    Generates a clickable thumbnail.
-    img_path: Relative path to the image
-    width: Display width of the thumbnail in the notebook
-    """
-    html_code = f'''
-    <a href="{img_path}" target="_blank">
-        <img src="{img_path}" style="width:{width}px; border:1px solid #ccc; border-radius:5px;">
-    </a>
-    <p><small>Source: {img_path}</small></p>
-    '''
-    display(HTML(html_code))
-
-
 # ----- Stage 2 display -------------------------------------------------------
 
 def symlink_stage2_pair_gifs(workdir: Path, link_dir: Path | None = None) -> list[Path]:

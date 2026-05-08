@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import pickle
 from pathlib import Path
 
