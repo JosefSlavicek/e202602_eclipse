@@ -80,11 +80,9 @@ def register_cross_exposure(img0, img1_scaled, moon0, moon1, gamma, t0, t1, devi
         img0 = torch.from_numpy(img0).to(device=device, dtype=torch.float32)
     if isinstance(img1_scaled, np.ndarray):
         img1_scaled = torch.from_numpy(img1_scaled).to(device=device, dtype=torch.float32)
-    g0 = img0.clone()
-    g1 = img1_scaled.clone()
-    apriori_valid = (g0 * ((t1 / t0) ** (1.0 / gamma)) <= 0.9).to(torch.float32)
+    apriori_valid = (img0 * ((t1 / t0) ** (1.0 / gamma)) <= 0.9).to(torch.float32)
     initial_shift_half = 2.0 * (5.0 * (2.0 + 2.0) + 0.0 + 3.0)
-    return grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, apriori_valid=apriori_valid)
+    return grid_search_registration(img0, img1_scaled, moon0, moon1, initial_shift_half, device, apriori_valid=apriori_valid)
 
 
 def load(stage1_pkl: Path):
@@ -119,7 +117,9 @@ def fullsize_averages(
             continue
         abs_xy = torch.from_numpy(opt_results[exp]["abs_xy"]).to(device)
         abs_angle_t = torch.from_numpy(opt_results[exp]["abs_angle_t"]).to(device)
-        avg_images[exp], _, _ = compute_weighted_average(group, abs_xy, abs_angle_t, device)
+        avg_img, _, _ = compute_weighted_average(group, abs_xy, abs_angle_t, device)
+        avg_images[exp] = avg_img.cpu()
+        del avg_img
 
     print(f"Built {len(avg_images)} averaged images (full size).")
     return avg_images
@@ -139,8 +139,9 @@ def cross_exposure_consecutive_pairs(
         t1 = exposure_times_sorted[idx + 1]
         if t0 not in avg_images or t1 not in avg_images:
             continue
-        img0 = avg_images[t0]
-        img1 = avg_images[t1]
+        torch.cuda.empty_cache()
+        img0 = avg_images[t0].to(device)
+        img1 = avg_images[t1].to(device)
         moon0 = moon_by_exp[t0]
         moon1 = moon_by_exp[t1]
 
@@ -148,10 +149,12 @@ def cross_exposure_consecutive_pairs(
         scale1 = (t0 / t1) ** (1.0 / gamma1)
         img1_scaled1 = (img1 * scale1).clamp(0.0, 1.0)
         shift_i, shift_j, rotation = register_cross_exposure(img0, img1_scaled1, moon0, moon1, gamma1, t0, t1, device)
+        del img1_scaled1
 
         gamma2 = estimate_gamma(img0, img1, moon0, moon1, t0, t1, device, transform=(shift_i, shift_j, rotation))
         scale2 = (t0 / t1) ** (1.0 / gamma2)
         img1_scaled2 = (img1 * scale2).clamp(0.0, 1.0)
+        del img1
         shift_i, shift_j, rotation = register_cross_exposure(img0, img1_scaled2, moon0, moon1, gamma2, t0, t1, device)
 
         pairs_results.append((t0, t1, gamma2, shift_i, shift_j, rotation))
@@ -172,6 +175,8 @@ def cross_exposure_consecutive_pairs(
         img1_aligned = apply_transform_single(img1_scaled2, shift_i, shift_j, rotation, device)
         crop0 = (img0[i_lo:i_hi, j_lo:j_hi].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         crop1 = (img1_aligned[i_lo:i_hi, j_lo:j_hi].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        del img0, img1_scaled2, img1_aligned
+        torch.cuda.empty_cache()
         pair_gif_dir.mkdir(parents=True, exist_ok=True)
         frame0 = Image.fromarray(np.stack([crop0, crop0, crop0], axis=-1))
         frame1 = Image.fromarray(np.stack([crop1, crop1, crop1], axis=-1))

@@ -8,7 +8,7 @@ from PIL import Image
 
 from eclipse_v1.coords import cartesian_to_polar, polar_to_cartesian
 
-GRID_BATCH_SIZE = 8
+GRID_BATCH_SIZE = 4
 
 
 def load_grayscale(ii, device):
@@ -315,12 +315,12 @@ def grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, a
             sin_a_t = torch.sin(
                 torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
             ).view(N, 1, 1)
-            warped = apply_transform_batched(g1.clone(), shift_i_t, shift_j_t, cos_a_t, sin_a_t)
+            warped = apply_transform_batched(g1, shift_i_t, shift_j_t, cos_a_t, sin_a_t)
             moon_centers_warped = transform_moon_center_batched(
                 moon1[0], moon1[1], ci, cj, shift_i_t, shift_j_t, cos_a_t, sin_a_t
             )
             best_setup = discrepancy_batched_fourier3(
-                g0.clone(),
+                g0,
                 warped,
                 moon0[:2],
                 r0,
