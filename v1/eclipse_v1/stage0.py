@@ -182,7 +182,7 @@ def _refine_moon_cluster_circumcenters(points_list, img_size):
             oi, oj, radius = cc_result
             circumcenters.append((oi, oj))
             radii.append(radius)
-    pts = np.array(circumcenters, dtype=np.float64)
+    pts = np.array(circumcenters, dtype=np.float32)
     Z = linkage(pts, method="complete")
     t_lo, t_hi = 0.0, float(Z[-1, 2])
     for _ in range(60):
@@ -380,9 +380,9 @@ def interpolate_missing_moons(image_infos: list, exposure_groups: dict) -> tuple
         if ii.moon is not None
     ]
     assert len(pts_with_moon) >= 2
-    t_arr = np.array([p[0] for p in pts_with_moon], dtype=np.float64)
-    i_arr = np.array([p[1] for p in pts_with_moon], dtype=np.float64)
-    j_arr = np.array([p[2] for p in pts_with_moon], dtype=np.float64)
+    t_arr = np.array([p[0] for p in pts_with_moon], dtype=np.float32)
+    i_arr = np.array([p[1] for p in pts_with_moon], dtype=np.float32)
+    j_arr = np.array([p[2] for p in pts_with_moon], dtype=np.float32)
     (a_i, b_i) = np.polyfit(t_arr, i_arr, 1)
     (a_j, b_j) = np.polyfit(t_arr, j_arr, 1)
 

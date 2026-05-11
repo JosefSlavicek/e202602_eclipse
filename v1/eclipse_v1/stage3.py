@@ -117,7 +117,7 @@ def _scale_to_ref(exposure_times_sorted, gamma_by_pair, k):
 
 
 def _weight_from_value(y, weight_sigma: float = MERGE_WEIGHT_SIGMA):
-    y = np.clip(y, 0.0, 1.0).astype(np.float64)
+    y = np.clip(y, 0.0, 1.0).astype(np.float32)
     return np.exp(-((y - 0.5) / weight_sigma) ** 2)
 
 
@@ -242,7 +242,7 @@ def _blur_dist_to_corners(ci, cj, H, W):
     return max(math.hypot(i - ci, j - cj) for i, j in corners)
 
 
-def _patch_window_flat_circle(a, dtype=np.float64):
+def _patch_window_flat_circle(a, dtype=np.float32):
     ci = (a - 1) / 2.0
     cj = (a - 1) / 2.0
     ii = np.arange(a, dtype=dtype).reshape(-1, 1)
@@ -308,8 +308,8 @@ def _make_fft_mask2_percentile_for_tile(
 
 def _radial_blend_fancy_plain(fancy_np, plain_np, mi, mj, moon_r, blur_sigma):
     H, W = plain_np.shape
-    ii = np.arange(H, dtype=np.float64)[:, None]
-    jj = np.arange(W, dtype=np.float64)[None, :]
+    ii = np.arange(H, dtype=np.float32)[:, None]
+    jj = np.arange(W, dtype=np.float32)[None, :]
     r = np.hypot(ii - float(mi), jj - float(mj))
     r0 = float(moon_r) + float(blur_sigma) * 3.0
     r1 = float(moon_r) + float(blur_sigma) * 4.0
@@ -414,7 +414,7 @@ def _sliding_diff_smooth_for_sigma(
     blurred = _radial_blend_fancy_plain(
         fancy_cart, blurred_plain, mi_crop, mj_crop, moon_r, blur_sigma
     )
-    diff_np = (display.astype(np.float64) - blurred.astype(np.float64)).astype(np.float32)
+    diff_np = (display.astype(np.float32) - blurred.astype(np.float32))
     H_d, W_d = display.shape
     assert H_d >= a and W_d >= a, (H_d, W_d, a)
     diff_t = torch.from_numpy(diff_np).to(device=dev, dtype=torch.float32)
@@ -534,8 +534,8 @@ def warp_merge_to_composite(ctx: Stage3Context) -> None:
 
     print(f"Exposures in chain: {len(exposures_with_chain)}")
     H_ref, W_ref = ctx.H_ref, ctx.W_ref
-    sum_val = np.zeros((H_ref, W_ref), dtype=np.float64)
-    sum_weight = np.zeros((H_ref, W_ref), dtype=np.float64)
+    sum_val = np.zeros((H_ref, W_ref), dtype=np.float32)
+    sum_weight = np.zeros((H_ref, W_ref), dtype=np.float32)
     valid_all = None
     mask_0 = avg_masks[min(avg_masks.keys())] > 0.99
     for t_k_index, t_k in tqdm.tqdm(enumerate(exposures_with_chain), desc="Warp and merge"):
@@ -547,7 +547,7 @@ def warp_merge_to_composite(ctx: Stage3Context) -> None:
         if scale_k is None:
             continue
 
-        orig = img_k.cpu().numpy().astype(np.float64)
+        orig = img_k.cpu().numpy().astype(np.float32)
         orig_clip = np.clip(orig, 0.0, 1.0)
         value_scaled = np.clip(orig * scale_k, 0.0, 1.0)
         weight_img = _weight_from_value(orig_clip)
@@ -559,8 +559,8 @@ def warp_merge_to_composite(ctx: Stage3Context) -> None:
         val_t = torch.from_numpy(value_scaled.astype(np.float32)).to(device)
         w_t = torch.from_numpy(weight_img.astype(np.float32)).to(device)
         valid_t = torch.ones_like(img_k, device=device, dtype=torch.float32)
-        warped_val = (_warp_to_ref(val_t, chain, H_ref, W_ref, device) * mask_0).cpu().numpy().astype(np.float64)
-        warped_w = _warp_to_ref(w_t, chain, H_ref, W_ref, device).cpu().numpy().astype(np.float64)
+        warped_val = (_warp_to_ref(val_t, chain, H_ref, W_ref, device) * mask_0).cpu().numpy().astype(np.float32)
+        warped_w = _warp_to_ref(w_t, chain, H_ref, W_ref, device).cpu().numpy().astype(np.float32)
         warped_valid = _warp_to_ref(valid_t, chain, H_ref, W_ref, device).cpu().numpy()
 
         use = warped_valid >= 0.5
@@ -573,7 +573,7 @@ def warp_merge_to_composite(ctx: Stage3Context) -> None:
             valid_all = np.minimum(valid_all, warped_valid)
 
     denom = np.maximum(sum_weight, 1e-20)
-    ctx.composite = (sum_val / denom).astype(np.float64)
+    ctx.composite = (sum_val / denom).astype(np.float32)
     ctx.valid_all = valid_all
     ctx.avg_images.clear()
     ctx.avg_masks.clear()
@@ -606,8 +606,8 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     ctx.H_crop, ctx.W_crop = composite_crop.shape
     print(f"Crop bounds rows [{r_lo},{r_hi}], cols [{c_lo},{c_hi}]; shape {composite_crop.shape}")
 
-    ii = np.arange(ctx.H_crop, dtype=np.float64).reshape(-1, 1)
-    jj = np.arange(ctx.W_crop, dtype=np.float64).reshape(1, -1)
+    ii = np.arange(ctx.H_crop, dtype=np.float32).reshape(-1, 1)
+    jj = np.arange(ctx.W_crop, dtype=np.float32).reshape(1, -1)
     dist_sq = (ii - mi_crop) ** 2 + (jj - mj_crop) ** 2
     moon_mask_preview = dist_sq <= (moon_r0**2)
 
@@ -622,7 +622,7 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     Image.fromarray((preview * 255).clip(0, 255).astype(np.uint8)).save(
         out_dir / "v1-stage3_composite_preview.png"
     )
-    print(f"Saved {out_dir / 'v1-stage3_composite.npy'} (float64), {out_dir / 'v1-stage3_composite_preview.png'}")
+    print(f"Saved {out_dir / 'v1-stage3_composite.npy'} (float32), {out_dir / 'v1-stage3_composite_preview.png'}")
 
     ctx.composite_crop = composite_crop
     ctx.mi_crop = float(mi_crop)
@@ -758,12 +758,12 @@ def radial_normalize_display(ctx: Stage3Context) -> None:
     mi_crop, mj_crop, moon_r = find_moon(img_rgb, float(mi_crop), float(mj_crop))
     ctx.mi_crop, ctx.mj_crop, ctx.moon_r = float(mi_crop), float(mj_crop), float(moon_r)
 
-    ii = np.arange(H_crop, dtype=np.float64).reshape(-1, 1)
-    jj = np.arange(W_crop, dtype=np.float64).reshape(1, -1)
+    ii = np.arange(H_crop, dtype=np.float32).reshape(-1, 1)
+    jj = np.arange(W_crop, dtype=np.float32).reshape(1, -1)
     dist_sq = (ii - mi_crop) ** 2 + (jj - mj_crop) ** 2
     ctx.moon_mask = dist_sq <= (moon_r**2)
 
-    img = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float64)
+    img = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float32)
     center = (float(mi_crop), float(mj_crop))
     radius_min = 0.0
     radius_max = _dist_to_corners(mi_crop, mj_crop, H_crop, W_crop)
@@ -834,7 +834,7 @@ def fft_unsharp_and_save(ctx: Stage3Context) -> None:
 def rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
     """RGB + vignette PNG and v1-stage3_radial.pkl sidecar."""
     assert ctx.sharpened_fft_diff is not None and ctx.moon_mask is not None #and ctx.p3_at is not None
-    gray = np.clip(ctx.sharpened_fft_diff.astype(np.float64), 0.0, 1.0)
+    gray = np.clip(ctx.sharpened_fft_diff.astype(np.float32), 0.0, 1.0)
     R = gray
     G = 0.16 + 0.84 * gray
     B = 0.30 + 0.70 * gray
@@ -849,8 +849,8 @@ def rgb_vignette_and_radial_pickle(ctx: Stage3Context) -> None:
         np.hypot(ci - (H - 1), cj - (W - 1)),
     )
     sigma = max(float(sigma), 1e-12)
-    ii = np.arange(H, dtype=np.float64).reshape(-1, 1)
-    jj = np.arange(W, dtype=np.float64).reshape(1, -1)
+    ii = np.arange(H, dtype=np.float32).reshape(-1, 1)
+    jj = np.arange(W, dtype=np.float32).reshape(1, -1)
     r = np.sqrt((ii - ci) ** 2 + (jj - cj) ** 2)
     g = np.exp(-0.5 * (r / sigma) ** 2)
     exp_half = np.exp(-0.5)

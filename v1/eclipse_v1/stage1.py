@@ -277,8 +277,8 @@ def optimize_poses_and_debug(
             exposure_time, n, reg_exp, device, n_iter=N_ITER, peak_lr=peak_lr, warmup_frac=warmup_frac
         )
         opt_results[exposure_time] = {
-            "abs_xy": abs_xy.detach().cpu().numpy().astype(np.float64),
-            "abs_angle_t": abs_angle_t.detach().cpu().numpy().astype(np.float64),
+            "abs_xy": abs_xy.detach().cpu().numpy().astype(np.float32),
+            "abs_angle_t": abs_angle_t.detach().cpu().numpy().astype(np.float32),
         }
 
         idx_show = random.randint(0, n - 1)
