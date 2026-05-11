@@ -66,8 +66,9 @@ def cartesian_to_polar(image, center, radius_min, radius_max, n_r, n_theta, mask
     dtype = image.dtype
     H, W = image.shape
     ci, cj = float(center[0]), float(center[1])
-    y = torch.arange(n_r, device=device, dtype=dtype).view(-1, 1)
-    x = torch.arange(n_theta, device=device, dtype=dtype).view(1, -1)
+    coord_dtype = torch.float32
+    y = torch.arange(n_r, device=device, dtype=coord_dtype).view(-1, 1)
+    x = torch.arange(n_theta, device=device, dtype=coord_dtype).view(1, -1)
     r = radius_max - y * (radius_max - radius_min) / max(n_r - 1, 1)
     theta = 2 * math.pi * x / (n_theta - 1) if n_theta > 1 else torch.zeros_like(x)
     i_src = ci + r * torch.sin(theta)
@@ -75,13 +76,14 @@ def cartesian_to_polar(image, center, radius_min, radius_max, n_r, n_theta, mask
     j_norm = 2.0 * j_src / (W - 1) - 1.0 if W > 1 else torch.zeros_like(j_src)
     i_norm = 2.0 * i_src / (H - 1) - 1.0 if H > 1 else torch.zeros_like(i_src)
     grid = torch.stack([j_norm, i_norm], dim=-1).unsqueeze(0)
+    del j_norm, i_norm
     polar = F.grid_sample(
-        image.unsqueeze(0).unsqueeze(0),
+        image.to(torch.float32).unsqueeze(0).unsqueeze(0),
         grid,
         mode="bilinear",
         padding_mode="zeros",
         align_corners=True,
-    ).squeeze(0).squeeze(0)
+    ).squeeze(0).squeeze(0).to(dtype)
     m = mask_margin
     mask = (i_src >= m) & (i_src < H - m) & (j_src >= m) & (j_src < W - m)
     return polar, mask

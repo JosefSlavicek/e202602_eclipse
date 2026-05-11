@@ -575,6 +575,8 @@ def warp_merge_to_composite(ctx: Stage3Context) -> None:
     denom = np.maximum(sum_weight, 1e-20)
     ctx.composite = (sum_val / denom).astype(np.float64)
     ctx.valid_all = valid_all
+    ctx.avg_images.clear()
+    ctx.avg_masks.clear()
     print(f"Composite shape {ctx.composite.shape}, dtype {ctx.composite.dtype}")
 
 
