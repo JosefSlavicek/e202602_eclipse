@@ -687,22 +687,25 @@ def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_
     for row_fraction in [0.15, 1.0]:
         n_cols_use = max(1, int(n_theta * row_fraction))
         half_window = n_cols_use // 2
-        polar_ext = torch.cat([polar_img, polar_img, polar_img], dim=1)
-        valid_ext = torch.cat([valid_for_mean, valid_for_mean, valid_for_mean], dim=1)
-        valid_ext[valid_ext > 0.5] = 1.0
-        valid_ext[valid_ext < 0.51] = 0.0
-        row_val_ext = (polar_ext * valid_ext).to(dtype)
-        row_cnt_ext = valid_ext.to(dtype)
+        right_pad = n_cols_use - half_window
+        valid_bin = (valid_for_mean > 0.5).to(dtype)
+        row_val_ext = F.pad(polar_img * valid_bin, (half_window, right_pad), mode='circular')
+        row_cnt_ext = F.pad(valid_bin, (half_window, right_pad), mode='circular')
+        del valid_bin
         cs_val = torch.cumsum(
             torch.cat([torch.zeros(n_r, 1, device=device, dtype=dtype), row_val_ext], dim=1), dim=1
         )
+        del row_val_ext
         cs_cnt = torch.cumsum(
             torch.cat([torch.zeros(n_r, 1, device=device, dtype=dtype), row_cnt_ext], dim=1), dim=1
         )
-        start = (n_theta - half_window + torch.arange(n_theta, device=device)).long()
+        del row_cnt_ext
+        start = torch.arange(n_theta, device=device).long()
         sum_v = cs_val[:, start + n_cols_use] - cs_val[:, start]
         sum_n = (cs_cnt[:, start + n_cols_use] - cs_cnt[:, start]).clamp(min=1e-20)
+        del cs_val, cs_cnt
         mean_polar_2d = sum_v / sum_n
+        del sum_v, sum_n
         assert torch.all(torch.isfinite(mean_polar_2d))
         argmax = mean_polar_2d.argmax(dim=0)
         max_val = mean_polar_2d.max(dim=0).values
@@ -710,10 +713,12 @@ def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_
         mean_polar_2d[mask] = max_val.unsqueeze(0).expand_as(mean_polar_2d)[mask]
 
         mean_at = polar_to_cartesian(mean_polar_2d, center, radius_min, radius_max, H_crop, W_crop)
+        del mean_polar_2d
         valid_mask = torch.isfinite(mean_at) & (mean_at > 0)
         display_t = torch.zeros_like(img, device=device, dtype=dtype)
         v = img[valid_mask]
         m_ = mean_at[valid_mask]
+        del mean_at
         mask1 = (v > m_ / 2) & (v <= m_)
         mask2 = (v > m_) & (v <= 2 * m_)
         mask3 = v > 2 * m_
@@ -723,6 +728,7 @@ def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_
         )
         display_t[valid_mask] = torch.where(mask3, torch.ones_like(v), display_t[valid_mask])
         display_ts.append(display_t)
+        torch.cuda.empty_cache()
     return torch.stack(display_ts).mean(dim=0)
 
 
@@ -772,6 +778,8 @@ def radial_normalize_display(ctx: Stage3Context) -> None:
 
     polar_img, valid_for_mean, valid = _polar_transform_and_extrapolate(img, center, radius_min, radius_max, n_r, n_theta)
     display_t = _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_max, n_r, n_theta)
+    del polar_img, valid_for_mean
+    torch.cuda.empty_cache()
     display_t = _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n_theta)
 
     ctx.display = display_t.cpu().numpy()
