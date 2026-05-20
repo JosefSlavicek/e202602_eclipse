@@ -191,6 +191,64 @@ def apply_transform_batched(img, shift_i_t, shift_j_t, cos_a_t, sin_a_t):
     ).squeeze(1)
 
 
+def clean_polar_fft(
+    img,
+    moon_center,
+    moon_radius,
+    *,
+    polar_center=None,
+    valid_row_mask=None,
+    antiprot=None,
+):
+    """Polar+FFT cleanup pipeline. Returns (cleaned_cart, cart_mask, antiprot_used).
+
+    Unwraps the corona around `polar_center` (defaults to `moon_center`), clips
+    protuberance peaks at `antiprot`, suppresses the moon-limb sharp step via
+    `fill_bottom`, strips low angular frequencies, and maps back to cartesian.
+    The cartesian mask zeros the moon disk via `fill_moon(moon_center, moon_radius)`.
+
+    `polar_center` overrides `moon_center` for the polar transform itself; this is
+    what Stage 2's common-center pipeline uses. `fill_moon` always uses the image's
+    actual moon, not `polar_center`.
+
+    `valid_row_mask` is an optional (n_r,) float tensor multiplied row-wise into both
+    the polar image and its companion ones-mask before `polar_to_cartesian` — used
+    by Stage 2 to exclude radii whose circle crosses either moon.
+
+    `antiprot` shares a single anti-protuberance threshold across multiple images of
+    the same group/pair: pass `None` for the first call, then re-use the returned value.
+    """
+    assert img.ndim == 2
+    polar_ctr = polar_center if polar_center is not None else moon_center
+    radius_max = min(
+        polar_ctr[0],
+        img.shape[0] - polar_ctr[0],
+        polar_ctr[1],
+        img.shape[1] - polar_ctr[1],
+    )
+    assert 32 < moon_radius < radius_max - 32
+    H_img, W_img = img.shape[0], img.shape[1]
+    n_r = int(radius_max - moon_radius + 1)
+    n_theta = int(2 * math.pi * radius_max)
+    polar_img, _ = cartesian_to_polar(img, polar_ctr, moon_radius, radius_max, n_r, n_theta)
+    if antiprot is None:
+        maxidx = polar_img.sum(dim=1).argmax()
+        maxrow = polar_img[maxidx, :]
+        maxrow = maxrow[maxrow > 0]
+        antiprot = maxrow.quantile(0.9)
+    polar_img[polar_img > antiprot] = antiprot
+    polar_img = fill_bottom(polar_img, 4)
+    polar_img = remove_lowfeq(polar_img, 16)
+    polar_mask = torch.ones_like(polar_img)
+    if valid_row_mask is not None:
+        polar_img = polar_img * valid_row_mask.view(-1, 1)
+        polar_mask = polar_mask * valid_row_mask.view(-1, 1)
+    cleaned_cart = polar_to_cartesian(polar_img, polar_ctr, moon_radius, radius_max, H_img, W_img)
+    cart_mask = polar_to_cartesian(polar_mask, polar_ctr, moon_radius, radius_max, H_img, W_img)
+    cart_mask = fill_moon(cart_mask, moon_center, moon_radius, 0.0)
+    return cleaned_cart, cart_mask, antiprot
+
+
 def discrepancy_batched_fourier3(
     target,
     warped,
@@ -223,34 +281,14 @@ def discrepancy_batched_fourier3(
     for i in range(len(moon_centers_warped)):
         list_of_all.append((warped[i], moon_centers_warped[i], moon_radius_warped))
     list_of_all_processed = []
-    antiprotuberance_threshold = None
+    antiprot = None
     for img, moon_center, moon_radius in list_of_all:
-        radius_max = min(
-            moon_center[0],
-            img.shape[0] - moon_center[0],
-            moon_center[1],
-            img.shape[1] - moon_center[1],
+        cleaned_cart, cart_mask, antiprot = clean_polar_fft(
+            img, moon_center, moon_radius, antiprot=antiprot
         )
-        assert 32 < moon_radius < radius_max - 32
-        H_img, W_img = img.shape[0], img.shape[1]
-        n_r = int(radius_max - moon_radius + 1)
-        n_theta = int(2 * math.pi * radius_max)
-        polar_img, _ = cartesian_to_polar(img, moon_center, moon_radius, radius_max, n_r, n_theta)
-        if antiprotuberance_threshold is None:
-            maxidx = polar_img.sum(dim=1).argmax()
-            maxrow = polar_img[maxidx, :]
-            maxrow = maxrow[maxrow > 0]
-            antiprotuberance_threshold = maxrow.quantile(0.9)
-        polar_img[polar_img > antiprotuberance_threshold] = antiprotuberance_threshold
-        polar_img = fill_bottom(polar_img, 4)
-        polar_img = remove_lowfeq(polar_img, 16)
-        img = polar_to_cartesian(polar_img, moon_center, moon_radius, radius_max, H_img, W_img)
         if blur_sigma > 0:
-            img = gaussian_blur(img, blur_sigma)
-        mask = torch.ones_like(polar_img)
-        mask = polar_to_cartesian(mask, moon_center, moon_radius, radius_max, H_img, W_img)
-        mask = fill_moon(mask, moon_center, moon_radius, 0.0)
-        list_of_all_processed.append((img, mask))
+            cleaned_cart = gaussian_blur(cleaned_cart, blur_sigma)
+        list_of_all_processed.append((cleaned_cart, cart_mask))
     target_img, target_mask = list_of_all_processed.pop(0)
     if apriori_valid is not None:
         target_mask = target_mask * apriori_valid.to(target_mask.device)
@@ -330,6 +368,131 @@ def grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device, a
                 blur_sigma,
                 best_setup,
                 apriori_valid,
+            )
+        best_shift_i, best_shift_j, best_angle, _, _ = best_setup
+        is_corner = len(shift_i_vals) > 2 and (
+            best_shift_i in [shift_i_vals[0], shift_i_vals[-1]] or best_shift_j in [shift_j_vals[0], shift_j_vals[-1]]
+        )
+        step_shift = step_shift / 2.0 if (refine_shift and not is_corner) else step_shift
+        is_corner = len(angle_vals) > 2 and best_angle in [angle_vals[0], angle_vals[-1]]
+        step_angle = step_angle / 2.0 if (refine_angle and not is_corner) else step_angle
+    return (float(best_shift_i), float(best_shift_j), float(best_angle))
+
+
+def compare_pre_cleaned_batch(
+    target_cart,
+    target_mask,
+    source_cart,
+    source_mask,
+    shift_i_t,
+    shift_j_t,
+    cos_a_t,
+    sin_a_t,
+    batch,
+    blur_sigma,
+    best_setup,
+):
+    """Warp pre-cleaned source by a batch of candidates, masked-L1 vs cleaned target, tournament reduce.
+
+    The source and target have been cleaned around their own native moons by `clean_polar_fft`
+    (see Fix 3 in perf_analysis_register_intra_exposure_pairs.md): polar-around-moon commutes
+    with cartesian translation of the source (the moon center moves with the image), and the
+    angular FFT cleanup is theta-shift invariant, so the per-candidate polar+FFT pipeline
+    reduces to a single per-image cleanup followed by per-candidate `grid_sample`.
+
+    Mutates `batch` in-place. Returns (shift_i, shift_j, angle, img, mask) of the best candidate.
+    """
+    assert target_cart.ndim == 2 and target_mask.ndim == 2
+    assert source_cart.ndim == 2 and source_mask.ndim == 2
+    assert len(batch) == shift_i_t.shape[0]
+    warped_imgs = apply_transform_batched(source_cart, shift_i_t, shift_j_t, cos_a_t, sin_a_t)
+    warped_masks = apply_transform_batched(source_mask, shift_i_t, shift_j_t, cos_a_t, sin_a_t)
+    if blur_sigma > 0:
+        target_cart_use = gaussian_blur(target_cart, blur_sigma)
+    else:
+        target_cart_use = target_cart
+    list_of_all_processed = []
+    for k in range(len(batch)):
+        wi = gaussian_blur(warped_imgs[k], blur_sigma) if blur_sigma > 0 else warped_imgs[k]
+        list_of_all_processed.append((wi, warped_masks[k]))
+    if best_setup is not None:
+        bs_shift_i, bs_shift_j, bs_angle, bs_img, bs_mask = best_setup
+        batch.append((bs_shift_i, bs_shift_j, bs_angle))
+        list_of_all_processed.append((bs_img, bs_mask))
+    assert len(list_of_all_processed) == len(batch)
+    while len(list_of_all_processed) >= 2:
+        shift_i_0, shift_j_0, angle_0 = batch.pop()
+        shift_i_1, shift_j_1, angle_1 = batch.pop()
+        warped_img_0, warped_mask_0 = list_of_all_processed.pop()
+        warped_img_1, warped_mask_1 = list_of_all_processed.pop()
+        mask = target_mask * warped_mask_0 * warped_mask_1
+        diff_0 = ((torch.abs(target_cart_use - warped_img_0) * mask).sum() / (mask.sum() + 1e-9)).item()
+        diff_1 = ((torch.abs(target_cart_use - warped_img_1) * mask).sum() / (mask.sum() + 1e-9)).item()
+        if diff_0 < diff_1:
+            batch.append((shift_i_0, shift_j_0, angle_0))
+            list_of_all_processed.append((warped_img_0, warped_mask_0))
+        else:
+            batch.append((shift_i_1, shift_j_1, angle_1))
+            list_of_all_processed.append((warped_img_1, warped_mask_1))
+    shift_i, shift_j, angle = batch.pop()
+    warped_img, warped_mask = list_of_all_processed.pop()
+    return shift_i, shift_j, angle, warped_img, warped_mask
+
+
+def stage1_grid_search(
+    target_cart,
+    target_mask,
+    source_cart,
+    source_mask,
+    initial_shift_half,
+    device,
+):
+    """Stage 1: refinement-loop grid search on pre-cleaned tensors.
+
+    Same iterative 5x5x5 / halving schedule as `grid_search_registration`, but operates on
+    pre-cleaned cartesian tensors (per-image cleanup hoisted upstream — see Fix 3 in
+    perf_analysis_register_intra_exposure_pairs.md). Initial angle step is 0.5 deg
+    (vs the legacy 5.0 deg): intra-exposure rotation between consecutive frames is small,
+    so the wide initial bracket was waste.
+    """
+    H, W = target_cart.shape
+    r_border = max(H, W)
+    best_shift_i, best_shift_j, best_angle = 0.0, 0.0, 0.0
+    step_shift = initial_shift_half / 2.0
+    step_angle = 0.5
+    refine_shift = refine_angle = True
+    best_setup = None
+    while refine_shift or refine_angle:
+        if step_shift < 0.1:
+            refine_shift = False
+        step_angle_in_px = step_angle * r_border * (math.pi / 180.0)
+        if step_angle_in_px < 0.1:
+            refine_angle = False
+        blur_sigma = 0.0 if (step_shift < 2 and step_angle_in_px < 2) else min(8, max(step_angle_in_px, step_shift))
+        shift_i_vals = [best_shift_i] if not refine_shift else [best_shift_i + step_shift * (k - 2) for k in range(5)]
+        shift_j_vals = [best_shift_j] if not refine_shift else [best_shift_j + step_shift * (k - 2) for k in range(5)]
+        angle_vals = [best_angle] if not refine_angle else [best_angle + step_angle * (k - 2) for k in range(5)]
+        triples = [(si, sj, a) for si in shift_i_vals for sj in shift_j_vals for a in angle_vals]
+        for start in range(0, len(triples), GRID_BATCH_SIZE):
+            batch = triples[start : start + GRID_BATCH_SIZE]
+            N = len(batch)
+            shift_i_t = torch.tensor([t[0] for t in batch], device=device, dtype=torch.float32).view(N, 1, 1)
+            shift_j_t = torch.tensor([t[1] for t in batch], device=device, dtype=torch.float32).view(N, 1, 1)
+            cos_a_t = torch.cos(
+                torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
+            ).view(N, 1, 1)
+            sin_a_t = torch.sin(
+                torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
+            ).view(N, 1, 1)
+            best_setup = compare_pre_cleaned_batch(
+                target_cart,
+                target_mask,
+                source_cart,
+                source_mask,
+                shift_i_t, shift_j_t, cos_a_t, sin_a_t,
+                list(batch),
+                blur_sigma,
+                best_setup,
             )
         best_shift_i, best_shift_j, best_angle, _, _ = best_setup
         is_corner = len(shift_i_vals) > 2 and (

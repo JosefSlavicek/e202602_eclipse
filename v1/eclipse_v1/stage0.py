@@ -26,8 +26,8 @@ from eclipse_v1.utils import (
     fill_moon,
     gaussian_blur,
     transform_moon_center_batched,
-    discrepancy_batched_fourier3,
-    grid_search_registration,
+    clean_polar_fft,
+    stage1_grid_search,
 )
 
 BRIGHTNESS_MIN = 0.0
@@ -285,21 +285,14 @@ class ApproxMoonFinder:
         return (i, j)
 
 
-def register_equal_exposure(image_info0, image_info1):
-    device = torch.device("cuda")
-    g0 = load_grayscale(image_info0, device)
-    g1 = load_grayscale(image_info1, device)
-    assert g1.shape == g0.shape
-    moon0 = image_info0.moon
-    moon1 = image_info1.moon
-    moon_radius_avg = (moon0[2] + moon1[2]) / 2.0
-    u0 = image_info0.moon_pos_std_px if image_info0.moon_pos_std_px is not None else 2.0
-    u1 = image_info1.moon_pos_std_px if image_info1.moon_pos_std_px is not None else 2.0
+def _initial_shift_half(ii_a, ii_b):
+    moon_radius_avg = (ii_a.moon[2] + ii_b.moon[2]) / 2.0
+    u_a = ii_a.moon_pos_std_px if ii_a.moon_pos_std_px is not None else 2.0
+    u_b = ii_b.moon_pos_std_px if ii_b.moon_pos_std_px is not None else 2.0
     sun_drift_per_sec = SUN_DRIFT_RATE * moon_radius_avg
-    dt_sec = abs(image_info1.timestamp - image_info0.timestamp)
+    dt_sec = abs(ii_b.timestamp - ii_a.timestamp)
     possible_sun_drift = dt_sec * sun_drift_per_sec
-    initial_shift_half = 2.0 * (5.0 * (u0 + u1) + possible_sun_drift + 3.0)
-    return grid_search_registration(g0, g1, moon0, moon1, initial_shift_half, device)
+    return 2.0 * (5.0 * (u_a + u_b) + possible_sun_drift + 3.0)
 
 
 def detect_moons(image_infos: list) -> None:
@@ -483,8 +476,20 @@ def _print_triplet_consistency(reg, exposure_time, group):
     print(f"  Check 2: ij mean={ijmean:.4f} max={ijmax:.4f}  rot mean={rotmean:.4f} max={rotmax:.4f}")
 
 
+ENABLE_STAGE_2 = False
+
+
 def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
-    """For each exposure, all ordered pairs: Fourier-style registration on GPU (slow loop)."""
+    """For each exposure, all ordered pairs: two-stage Fourier-style registration on GPU.
+
+    Stage 1 (always): per-image polar+FFT cleanup is hoisted out of the per-pair grid search
+    (Fix 3 in v1/perf_analysis_register_intra_exposure_pairs.md). Each image is loaded and
+    cleaned once per group; the grid search then compares pre-cleaned cartesian tensors.
+
+    Stage 2 (gated by ENABLE_STAGE_2): per-pair finetune with a common polar center between
+    the two moons. Not yet implemented.
+    """
+    device = torch.device("cuda")
     reg = {}
     for exposure_time in sorted(exposure_groups.keys()):
         print(f"Doing check for exposure time {exposure_time}")
@@ -493,11 +498,28 @@ def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
         if n < 2:
             print(f"  Skip (group size {n} < 2)")
             continue
+        raws = [load_grayscale(ii, device) for ii in group]
+        antiprot = None
+        cleans = []
+        for raw, ii in zip(raws, group):
+            cleaned_cart, cart_mask, antiprot = clean_polar_fft(
+                raw, ii.moon[:2], ii.moon[2], antiprot=antiprot
+            )
+            cleans.append((cleaned_cart, cart_mask))
         tasks = [(i, j) for i, j in itertools.permutations(range(n), 2)]
         for i, j in tqdm.tqdm(tasks, desc="Registration pairs"):
-            key = (exposure_time, i, j)
-            shift_i, shift_j, rotation = register_equal_exposure(group[i], group[j])
-            reg[key] = (shift_i, shift_j, rotation)
+            initial_shift_half = _initial_shift_half(group[i], group[j])
+            target_cart, target_mask = cleans[i]
+            source_cart, source_mask = cleans[j]
+            T1 = stage1_grid_search(
+                target_cart, target_mask, source_cart, source_mask, initial_shift_half, device
+            )
+            if ENABLE_STAGE_2:
+                # TODO: stage2_finetune lands in the next commit
+                T = T1
+            else:
+                T = T1
+            reg[(exposure_time, i, j)] = T
         _print_pair_consistency(reg, exposure_time, group)
         if n >= 3:
             _print_triplet_consistency(reg, exposure_time, group)
