@@ -28,6 +28,7 @@ from eclipse_v1.utils import (
     transform_moon_center_batched,
     clean_polar_fft,
     stage1_grid_search,
+    stage2_finetune,
 )
 
 BRIGHTNESS_MIN = 0.0
@@ -486,8 +487,10 @@ def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
     (Fix 3 in v1/perf_analysis_register_intra_exposure_pairs.md). Each image is loaded and
     cleaned once per group; the grid search then compares pre-cleaned cartesian tensors.
 
-    Stage 2 (gated by ENABLE_STAGE_2): per-pair finetune with a common polar center between
-    the two moons. Not yet implemented.
+    Stage 2 (gated by ENABLE_STAGE_2): per-pair narrow-bracket finetune around Stage 1's
+    result, using a common polar center C midway between the two moons. Cleanup re-runs
+    per candidate around C; the moon-limb feature lands at near-identical (r, theta) in
+    both images so it cancels in the L1 diff.
     """
     device = torch.device("cuda")
     reg = {}
@@ -515,8 +518,7 @@ def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
                 target_cart, target_mask, source_cart, source_mask, initial_shift_half, device
             )
             if ENABLE_STAGE_2:
-                # TODO: stage2_finetune lands in the next commit
-                T = T1
+                T = stage2_finetune(raws[i], raws[j], group[i].moon, group[j].moon, T1, device)
             else:
                 T = T1
             reg[(exposure_time, i, j)] = T

@@ -502,3 +502,166 @@ def stage1_grid_search(
         is_corner = len(angle_vals) > 2 and best_angle in [angle_vals[0], angle_vals[-1]]
         step_angle = step_angle / 2.0 if (refine_angle and not is_corner) else step_angle
     return (float(best_shift_i), float(best_shift_j), float(best_angle))
+
+
+def _apply_transform_to_point(pi, pj, shift_i, shift_j, angle_deg, ci, cj):
+    """Forward transform of a single (i, j) point, matching apply_transform_batched's convention."""
+    di = pi - ci
+    dj = pj - cj
+    cos_a = math.cos(math.radians(-angle_deg))
+    sin_a = math.sin(math.radians(-angle_deg))
+    di_rot = di * cos_a - dj * sin_a
+    dj_rot = di * sin_a + dj * cos_a
+    return (di_rot + shift_i + ci, dj_rot + shift_j + cj)
+
+
+def _compare_batch_common_C(
+    warped,
+    moon_centers_warped,
+    moon_radius_warped,
+    target_cart,
+    target_mask,
+    polar_center,
+    valid_row_mask,
+    antiprot,
+    batch,
+    blur_sigma,
+    best_setup,
+):
+    """Stage 2 per-candidate clean+compare: re-clean each warped image around the common C, masked L1 vs once-cleaned target.
+
+    The target was cleaned once per pair (does not change with the candidate). The warped
+    source is re-cleaned per candidate because polar-around-C does not commute with
+    cartesian translation of the source (unlike Stage 1's moon-locked polar), so the warped
+    moon position changing within the search bound matters.
+    """
+    target_cart_use = gaussian_blur(target_cart, blur_sigma) if blur_sigma > 0 else target_cart
+    list_of_all_processed = []
+    for k in range(len(warped)):
+        cleaned_cart, cart_mask, _ = clean_polar_fft(
+            warped[k],
+            moon_centers_warped[k],
+            moon_radius_warped,
+            polar_center=polar_center,
+            valid_row_mask=valid_row_mask,
+            antiprot=antiprot,
+        )
+        if blur_sigma > 0:
+            cleaned_cart = gaussian_blur(cleaned_cart, blur_sigma)
+        list_of_all_processed.append((cleaned_cart, cart_mask))
+    if best_setup is not None:
+        bs_shift_i, bs_shift_j, bs_angle, bs_img, bs_mask = best_setup
+        batch.append((bs_shift_i, bs_shift_j, bs_angle))
+        list_of_all_processed.append((bs_img, bs_mask))
+    assert len(list_of_all_processed) == len(batch)
+    while len(list_of_all_processed) >= 2:
+        shift_i_0, shift_j_0, angle_0 = batch.pop()
+        shift_i_1, shift_j_1, angle_1 = batch.pop()
+        warped_img_0, warped_mask_0 = list_of_all_processed.pop()
+        warped_img_1, warped_mask_1 = list_of_all_processed.pop()
+        mask = target_mask * warped_mask_0 * warped_mask_1
+        diff_0 = ((torch.abs(target_cart_use - warped_img_0) * mask).sum() / (mask.sum() + 1e-9)).item()
+        diff_1 = ((torch.abs(target_cart_use - warped_img_1) * mask).sum() / (mask.sum() + 1e-9)).item()
+        if diff_0 < diff_1:
+            batch.append((shift_i_0, shift_j_0, angle_0))
+            list_of_all_processed.append((warped_img_0, warped_mask_0))
+        else:
+            batch.append((shift_i_1, shift_j_1, angle_1))
+            list_of_all_processed.append((warped_img_1, warped_mask_1))
+    shift_i, shift_j, angle = batch.pop()
+    warped_img, warped_mask = list_of_all_processed.pop()
+    return shift_i, shift_j, angle, warped_img, warped_mask
+
+
+def stage2_finetune(g0, g1, moon0, moon1, T1, device):
+    """Stage 2: narrow-bracket finetune of T1 with a common per-pair polar center C.
+
+    C is the midpoint between moon_i and the Stage-1-aligned moon_j position. Cleanup
+    re-runs per candidate (warp first, then polar around C, then FFT clean) because
+    polar-around-C is not translation-invariant in the source — the warped moon position
+    drifts within the search band.
+
+    Symmetric placement of C makes the moon-limb feature land at near-identical (r, theta)
+    in both images so it cancels in the L1 diff. The 1-D row mask additionally zeros
+    out polar rows whose circle around C would cross either moon disk, plus a 2 px
+    margin for the candidate band.
+
+    Returns the refined (shift_i, shift_j, angle), replacing T1.
+    """
+    shift_i_1, shift_j_1, angle_1 = T1
+    H, W = g0.shape
+    ci, cj = H / 2.0, W / 2.0
+    moon_j_aligned = _apply_transform_to_point(
+        moon1[0], moon1[1], shift_i_1, shift_j_1, angle_1, ci, cj
+    )
+    C = (0.5 * (moon0[0] + moon_j_aligned[0]), 0.5 * (moon0[1] + moon_j_aligned[1]))
+    R_i, R_j = moon0[2], moon1[2]
+    R_moon = 0.5 * (R_i + R_j)
+    moon_radius_common = max(R_i, R_j)
+    d_i = math.hypot(C[0] - moon0[0], C[1] - moon0[1])
+    d_j = math.hypot(C[0] - moon_j_aligned[0], C[1] - moon_j_aligned[1])
+    candidate_shift_margin = 2.0
+    r_min_valid = max(d_i + R_i, d_j + R_j) + candidate_shift_margin
+    radius_max = min(C[0], H - C[0], C[1], W - C[1])
+    n_r = int(radius_max - moon_radius_common + 1)
+    y = torch.arange(n_r, device=device, dtype=torch.float32)
+    r_per_row = radius_max - y * (radius_max - moon_radius_common) / max(n_r - 1, 1)
+    valid_row_mask = (r_per_row >= r_min_valid).to(torch.float32)
+    target_cart, target_mask, antiprot = clean_polar_fft(
+        g0, moon0[:2], moon_radius_common,
+        polar_center=C,
+        valid_row_mask=valid_row_mask,
+    )
+    best_shift_i, best_shift_j, best_angle = float(shift_i_1), float(shift_j_1), float(angle_1)
+    step_shift = 0.5
+    step_angle = 0.5 * math.degrees(1.0 / R_moon)
+    refine_shift = refine_angle = True
+    best_setup = None
+    r_border = max(H, W)
+    while refine_shift or refine_angle:
+        if step_shift < 0.1:
+            refine_shift = False
+        step_angle_in_px = step_angle * r_border * (math.pi / 180.0)
+        if step_angle_in_px < 0.1:
+            refine_angle = False
+        blur_sigma = 0.0 if (step_shift < 2 and step_angle_in_px < 2) else min(8, max(step_angle_in_px, step_shift))
+        shift_i_vals = [best_shift_i] if not refine_shift else [best_shift_i + step_shift * (k - 2) for k in range(5)]
+        shift_j_vals = [best_shift_j] if not refine_shift else [best_shift_j + step_shift * (k - 2) for k in range(5)]
+        angle_vals = [best_angle] if not refine_angle else [best_angle + step_angle * (k - 2) for k in range(5)]
+        triples = [(si, sj, a) for si in shift_i_vals for sj in shift_j_vals for a in angle_vals]
+        for start in range(0, len(triples), GRID_BATCH_SIZE):
+            batch = triples[start : start + GRID_BATCH_SIZE]
+            N = len(batch)
+            shift_i_t = torch.tensor([t[0] for t in batch], device=device, dtype=torch.float32).view(N, 1, 1)
+            shift_j_t = torch.tensor([t[1] for t in batch], device=device, dtype=torch.float32).view(N, 1, 1)
+            cos_a_t = torch.cos(
+                torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
+            ).view(N, 1, 1)
+            sin_a_t = torch.sin(
+                torch.tensor([math.radians(-t[2]) for t in batch], device=device, dtype=torch.float32)
+            ).view(N, 1, 1)
+            warped = apply_transform_batched(g1, shift_i_t, shift_j_t, cos_a_t, sin_a_t)
+            moon_centers_warped = transform_moon_center_batched(
+                moon1[0], moon1[1], ci, cj, shift_i_t, shift_j_t, cos_a_t, sin_a_t
+            )
+            best_setup = _compare_batch_common_C(
+                warped,
+                moon_centers_warped,
+                moon_radius_common,
+                target_cart,
+                target_mask,
+                C,
+                valid_row_mask,
+                antiprot,
+                list(batch),
+                blur_sigma,
+                best_setup,
+            )
+        best_shift_i, best_shift_j, best_angle, _, _ = best_setup
+        is_corner = len(shift_i_vals) > 2 and (
+            best_shift_i in [shift_i_vals[0], shift_i_vals[-1]] or best_shift_j in [shift_j_vals[0], shift_j_vals[-1]]
+        )
+        step_shift = step_shift / 2.0 if (refine_shift and not is_corner) else step_shift
+        is_corner = len(angle_vals) > 2 and best_angle in [angle_vals[0], angle_vals[-1]]
+        step_angle = step_angle / 2.0 if (refine_angle and not is_corner) else step_angle
+    return (float(best_shift_i), float(best_shift_j), float(best_angle))
