@@ -684,28 +684,25 @@ def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_
     dtype = img.dtype
     H_crop, W_crop = img.shape[:2]
     display_ts = []
+    valid_bin = (valid_for_mean > 0.5).to(dtype)
     for row_fraction in [0.15, 1.0]:
         n_cols_use = max(1, int(n_theta * row_fraction))
-        half_window = n_cols_use // 2
-        right_pad = n_cols_use - half_window
-        valid_bin = (valid_for_mean > 0.5).to(dtype)
-        row_val_ext = F.pad(polar_img * valid_bin, (half_window, right_pad), mode='circular')
-        row_cnt_ext = F.pad(valid_bin, (half_window, right_pad), mode='circular')
-        del valid_bin
-        cs_val = torch.cumsum(
-            torch.cat([torch.zeros(n_r, 1, device=device, dtype=dtype), row_val_ext], dim=1), dim=1
-        )
-        del row_val_ext
-        cs_cnt = torch.cumsum(
-            torch.cat([torch.zeros(n_r, 1, device=device, dtype=dtype), row_cnt_ext], dim=1), dim=1
-        )
-        del row_cnt_ext
-        start = torch.arange(n_theta, device=device).long()
-        sum_v = cs_val[:, start + n_cols_use] - cs_val[:, start]
-        sum_n = (cs_cnt[:, start + n_cols_use] - cs_cnt[:, start]).clamp(min=1e-20)
-        del cs_val, cs_cnt
-        mean_polar_2d = sum_v / sum_n
-        del sum_v, sum_n
+        if n_cols_use >= n_theta:
+            # Full-row circular window: mean is constant along theta — skip padding/pooling.
+            val_sum = (polar_img * valid_bin).sum(dim=1, keepdim=True)
+            cnt_sum = valid_bin.sum(dim=1, keepdim=True).clamp(min=1e-20)
+            mean_polar_2d = (val_sum / cnt_sum).expand(n_r, n_theta).contiguous()
+        else:
+            half_window = n_cols_use // 2
+            right_pad = n_cols_use - half_window - 1
+            pv_ext = F.pad((polar_img * valid_bin).unsqueeze(1), (half_window, right_pad), mode='circular')
+            mean_v = F.avg_pool1d(pv_ext, kernel_size=n_cols_use, stride=1).squeeze(1)
+            del pv_ext
+            vb_ext = F.pad(valid_bin.unsqueeze(1), (half_window, right_pad), mode='circular')
+            mean_n = F.avg_pool1d(vb_ext, kernel_size=n_cols_use, stride=1).squeeze(1).clamp(min=1e-20)
+            del vb_ext
+            mean_polar_2d = mean_v / mean_n
+            del mean_v, mean_n
         assert torch.all(torch.isfinite(mean_polar_2d))
         argmax = mean_polar_2d.argmax(dim=0)
         max_val = mean_polar_2d.max(dim=0).values
@@ -729,6 +726,7 @@ def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_
         display_t[valid_mask] = torch.where(mask3, torch.ones_like(v), display_t[valid_mask])
         display_ts.append(display_t)
         torch.cuda.empty_cache()
+    del valid_bin
     return torch.stack(display_ts).mean(dim=0)
 
 
