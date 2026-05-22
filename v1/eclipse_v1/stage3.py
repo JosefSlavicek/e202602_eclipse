@@ -740,7 +740,20 @@ def _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n
     q = torch.linspace(
         start=0.03, end=0.0001, steps=polar_display.shape[0], device=polar_display.device, dtype=polar_display.dtype
     )
-    p3_row = polar_display.quantile(q=q, dim=1).diag()
+    # Equivalent to polar_display.quantile(q=q, dim=1).diag() (linear interp, the
+    # torch.quantile default), but avoids materializing the [n_r, n_r] all-pairs
+    # matrix that .diag() immediately discards.
+    sorted_row, _ = polar_display.sort(dim=1)
+    n_cols = sorted_row.shape[1]
+    pos = q * (n_cols - 1)
+    lo = pos.floor().long().clamp(max=n_cols - 1)
+    up = (lo + 1).clamp(max=n_cols - 1)
+    frac = pos - lo.to(pos.dtype)
+    row_idx = torch.arange(sorted_row.shape[0], device=sorted_row.device)
+    v_lo = sorted_row[row_idx, lo]
+    v_up = sorted_row[row_idx, up]
+    p3_row = v_lo + frac * (v_up - v_lo)
+    del sorted_row, v_lo, v_up
     p3_smooth = _vertical_gaussian_blur(p3_row.unsqueeze(1), kernel_size=133, sigma=33).squeeze(1)
     p3_polar_2d = p3_smooth.unsqueeze(1).expand(n_r, n_theta)
     p3_at = torch.nan_to_num(
