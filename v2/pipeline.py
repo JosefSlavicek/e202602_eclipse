@@ -17,11 +17,14 @@ ROOT = _find_package_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import argparse
+
 import torch
 from eclipse_v2.device import configure_cuda_visible_devices, require_cuda
 from eclipse_v2 import stage0 as s0
 from eclipse_v2 import stage1 as s1
 from eclipse_v2 import stage2 as s2
+from eclipse_v2.inputs import make_source, attach_source
 from eclipse_v2.stage3 import (
     Stage3Context,
     build_per_exposure_averages,
@@ -33,13 +36,32 @@ from eclipse_v2.stage3 import (
     warp_merge_to_composite,
 )
 
+
+def _parse_args():
+    ap = argparse.ArgumentParser(description="Eclipse v2 pipeline")
+    ap.add_argument("--input-mode", choices=["jpg", "nef", "inject"],
+                    default=os.environ.get("ECLIPSE_V2_INPUT_MODE", "jpg"))
+    ap.add_argument("--jpg-dir", type=Path,
+                    default=Path(os.environ.get("EDA00_DATA_ROOT", "/home/slavik/e202602_eclipse/data")))
+    ap.add_argument("--nef-dir", type=Path,
+                    default=Path(os.environ.get("ECLIPSE_V2_NEF_DIR", "/home/slavik/tmp/eclipse_fake_imgs")))
+    ap.add_argument("--workdir", type=Path,
+                    default=Path(os.environ.get("ECLIPSE_V2_WORKDIR", "/home/slavik/tmp/eclipse_v2_run")))
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
     configure_cuda_visible_devices()
     require_cuda()
 
-    DATA_ROOT = Path(os.environ.get("EDA00_DATA_ROOT", "/home/slavik/e202602_eclipse/data"))
-    WORKDIR = Path(os.environ.get("ECLIPSE_V2_WORKDIR", "/home/slavik/tmp/eclipse_v2_run"))
+    args = _parse_args()
+    WORKDIR = args.workdir
     WORKDIR.mkdir(parents=True, exist_ok=True)
+
+    source = make_source(
+        args.input_mode, jpg_dir=args.jpg_dir, nef_dir=args.nef_dir
+    )
+    print(f"Input mode: {source.kind} (is_linear={source.is_linear})")
 
     PK_STAGE0 = WORKDIR / "v2-stage0.pkl"
     PK_STAGE1 = WORKDIR / "v2-stage1.pkl"
@@ -51,7 +73,7 @@ if __name__ == "__main__":
 
     print("=== Stage 0: ingest, moon detection, intra-exposure registration ===")
 
-    image_infos = s0.get_image_infos(DATA_ROOT)
+    image_infos = s0.get_image_infos(source)
     print(f"Found {len(image_infos)} images, first: {image_infos[0].path}")
 
     exposure_groups = s0.group_by_exposure(image_infos)
@@ -75,6 +97,7 @@ if __name__ == "__main__":
     print("\n=== Stage 1: prune stacks, global pose fit per exposure ===")
 
     exposure_groups, reg = s1.load(PK_STAGE0)
+    attach_source(exposure_groups, source)
     s1.prune_groups(exposure_groups, reg)
 
     opt_results = s1.optimize_poses_and_debug(
@@ -89,6 +112,7 @@ if __name__ == "__main__":
     print("\n=== Stage 2: full-res stack means, cross-exposure chain ===")
 
     exposure_groups, _reg, opt_results = s2.load(PK_STAGE1)
+    attach_source(exposure_groups, source)
     moon_by_exp, exposure_times_sorted = s2.moon_median_table(exposure_groups)
 
     avg_images = s2.fullsize_averages(
@@ -96,7 +120,8 @@ if __name__ == "__main__":
     )
 
     pairs_results = s2.cross_exposure_consecutive_pairs(
-        exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir=WORKDIR
+        exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir=WORKDIR,
+        is_linear=source.is_linear,
     )
 
     s2.save_pickle(PK_STAGE2, pairs_results)
@@ -108,6 +133,7 @@ if __name__ == "__main__":
 
     ctx = Stage3Context(workdir=WORKDIR)
     load_inputs(ctx)
+    attach_source(ctx.exposure_groups, source)
     build_per_exposure_averages(ctx)
     warp_merge_to_composite(ctx)
     crop_and_save_composite(ctx)

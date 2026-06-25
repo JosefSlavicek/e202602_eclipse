@@ -53,6 +53,15 @@ class ImageInfo:
     moon: tuple[float, float, float] = None
     moon_info_origin: MoonInfoOrigin = None
     moon_pos_std_px: float = None
+    source: object = None       # active FrameSource; re-attached per stage, never pickled
+    link: tuple = None          # injection linkage (e.g. per-frame seed); pickled, frozen
+
+    def __getstate__(self):
+        # Do not pickle `source` (it may hold a large radiance map and is reconstructed
+        # cheaply via inputs.attach_source after each load).
+        state = self.__dict__.copy()
+        state["source"] = None
+        return state
 
 
 def get_info_from_exif(img_path: Path):
@@ -64,7 +73,7 @@ def get_info_from_exif(img_path: Path):
     subsec_date_time_original = metadata.get("Composite:SubSecDateTimeOriginal")
     assert subsec_date_time_original is not None
     assert re.match(
-        r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}\.\d{2}-\d{2}:\d{2}",
+        r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}\.\d{2}[-+]\d{2}:\d{2}",
         subsec_date_time_original,
     ), subsec_date_time_original
     expected_format = "%Y:%m:%d %H:%M:%S.%f%z"
@@ -78,32 +87,19 @@ def get_info_from_exif(img_path: Path):
     return float(exposure_time), timestamp
 
 
-def get_image_infos(data_root: str | Path):
-    root = Path(data_root)
-    jpg_files = list(root.rglob("*.jpg")) + list(root.rglob("*.JPG"))
-    image_infos = []
-    for jpg_file in tqdm.tqdm(jpg_files, desc="First scan of images"):
-        with Image.open(jpg_file) as img:
-            width, height = img.size
-            avg_brightness = np.array(img).astype(np.float32).mean() / 255.0
-            assert BRIGHTNESS_MIN <= avg_brightness <= BRIGHTNESS_MAX, (jpg_file, avg_brightness)
-            exposure_time, timestamp = get_info_from_exif(jpg_file)
-            image_infos.append(
-                ImageInfo(
-                    path=jpg_file,
-                    width=width,
-                    height=height,
-                    avg_brightness=avg_brightness,
-                    timestamp=timestamp,
-                    exposure_time=exposure_time,
-                )
-            )
+def get_image_infos(source):
+    """Enumerate frames via the active FrameSource (jpg / nef / inject)."""
+    image_infos = list(tqdm.tqdm(source.scan(), desc="First scan of images"))
+    for ii in image_infos:
+        assert BRIGHTNESS_MIN <= ii.avg_brightness <= BRIGHTNESS_MAX, (ii.path, ii.avg_brightness)
     assert len(image_infos) > 0
     for ii in image_infos:
         assert ii.width == image_infos[0].width
         assert ii.height == image_infos[0].height
     image_infos.sort(key=lambda x: x.avg_brightness)
-    assert image_infos[-1].avg_brightness > 0.1, ('Suspiciously low brightness ... are we interpreting data correctly?', [ii.avg_brightness for ii in image_infos])
+    assert image_infos[-1].avg_brightness > source.min_peak_brightness, (
+        'Suspiciously low brightness ... are we interpreting data correctly?',
+        [ii.avg_brightness for ii in image_infos])
     return image_infos
 
 
@@ -298,9 +294,9 @@ def _initial_shift_half(ii_a, ii_b):
 
 def detect_moons(image_infos: list) -> None:
     """GPU: approximate disk finder + gradient/triplet refine; sets moon on each ImageInfo."""
+    device = torch.device("cuda")
     for ii in tqdm.tqdm(image_infos, desc="Finding moon"):
-        img = Image.open(ii.path)
-        img_arr = torch.from_numpy(np.array(img).astype(np.float32) / 255.0).cuda()
+        img_arr = ii.source.load_rgb(ii, device)
         assert img_arr.ndim == 3 and img_arr.shape[-1] == 3, img_arr.shape
         i0, j0 = ApproxMoonFinder.find_moon_approx(img_arr)
         i, j, radius = find_moon(img_arr, i0, j0)

@@ -7,8 +7,17 @@ v2 supports 3 input modes:
 1. **jpg** — folder of JPGs, identical to today (v1 behavior).
 2. **nef** — folder of `.NEF`, decoded as real linear raw (real corona content).
 3. **inject** — folder of `.NEF` (counts/exposures/timestamps/noise from real NEFs) +
-   corona content faked from the v1 HDR composite, re-exposed per frame so the linear
-   exposure law (`signal ∝ radiance·t`) holds across the synthetic bracket.
+   corona content faked per frame from the nearest-log v1 JPG exposure group, placed on
+   the real NEF noise floor.
+
+   NOTE (design change during impl): the original idea was to re-expose a single v1-composite
+   radiance map by `t/t_norm` for a strictly linear bracket. Rejected after testing: the
+   composite is tone-compressed (~100:1) and cannot span the real bracket (~1e4:1) — short
+   frames collapse to the noise floor, their moon becomes undetectable, and the O(n^2)
+   intra-exposure registration (the dominant cost we measure) would run on fewer frames than
+   reality. Per-exposure JPG content gives every exposure detectable structure → stage0 runs
+   at true scale. Tradeoff: cross-exposure brightness isn't perfectly linear; mode 2 on real
+   corona NEFs remains the true test of linear handling.
 
 Primary purpose of mode 3: validate **runtime/memory at real-eclipse scale** (183 frames,
 real bracket structure) on the **same code path** the real corona NEFs will take.
@@ -77,19 +86,22 @@ and stored `gamma_by_pair`. stage3 unchanged (`(t0/t1)**(1/1)` = t0/t1). Harden
 - construct `source` once; reattach after every pickle `load` via `attach_source`.
 - stage funcs that scan/detect get `source` passed in.
 
-## Mode-3 injection detail (NefInjectSource)
-Construction: load ρ = v1 composite (float32, HxW, moon blackened); know ρ moon center
-(≈ ρ array center, refine with find_moon at build OR assume center). t_norm = max exposure.
-`scan` stores per-frame `link = (seed,)`, seed = stable hash of filename.
+## Mode-3 injection detail (NefInjectSource) — AS IMPLEMENTED
+`__init__(nef_dir, jpg_dir)`. `scan`:
+- build ImageInfo per NEF WITHOUT decoding the raw (W/H = SENSOR_W/H constants; exposure +
+  timestamp from `get_info_from_exif`) — the repeated-decode cost belongs in load_gray.
+- read JPG exposures (exiftool batch), group, sort NEFs by exposure, round-robin the
+  nearest-log group so siblings get different JPGs.
+- store `ii.link = (seed, jpg_path)`, seed = stable hash of filename (deterministic).
+- set `ii.avg_brightness` = mean linear luminance of the assigned JPG (NOT the black NEF!),
+  so the brightness sort/assert reflect injected content.
 
-`load_gray(ii)` — deterministic pure fn of fixed NEF file + ρ + ii.{exposure,timestamp,link}:
-1. `L_real` = real NEF linear luminance (genuine black-level + read-noise floor).
-2. target moon center = base_center + drift·(t−t0) + jitter(seed) (±5px/±0.2° affine, seeded).
-3. place/scale ρ into sensor raster so ρ-moon → target center (affine warp; pad outside with 0).
-4. `signal = clip(ρ_placed · (exposure / t_norm), 0, 1)`  ← linear exposure law.
-5. `gray = clip(signal + L_real + seeded_noise, 0, 1)`.
-
-Reuse `make_fake_inputs._jitter_affine` / `srgb_to_linear` ideas.
+`load_gray(ii)` — deterministic pure fn of (assigned JPG, seed, fixed NEF file):
+1. `signal` = `_jitter_luminance(jpg, seed)` — resize to sensor, seeded ±5px/±0.2° affine,
+   sRGB→linear, mean over channels.
+2. `L_real` = real NEF linear decode (genuine noise floor; decoding also makes mode-3 decode
+   timing representative of mode 2).
+3. `gray = clip(signal + L_real + seeded_shot_noise, 0, 1)`.
 
 ## Heuristics that assume gamma-encoded [0,1] (audit)
 Relative/scale-invariant (NO change): brightness-outlier prune, radial tone map (vs local
@@ -103,6 +115,21 @@ keep, verify on a linear run.
 2. NefSource scan/decode → mode nef runs on black NEFs (empty but path+timing real).
 3. stage2 gamma=1 gating → mode nef cross-exposure correct.
 4. NefInjectSource → mode inject = the perf/realism target (full 183 run).
+
+## Fixes found during implementation (all committed)
+- `get_info_from_exif` regex hardcoded a `-` timezone offset; real/test NEFs use `+01:00`.
+  Relaxed to `[-+]` (superset → jpg mode unaffected).
+- mode-3 `avg_brightness` must come from the assigned JPG, not the black NEF raw mean.
+- `NefSource.min_peak_brightness = 0.0` so the all-black test NEFs pass the scan assert.
+
+## Component tests done (pre-handoff)
+- compile + CLI ok; ImageInfo `__getstate__` strips `source`, keeps `link`.
+- NEF linear decode ok (4040×6064, faint = real floor); EXIF parse ok after fix.
+- mode-3 scan assignment (siblings get distinct JPGs), avg_brightness content-derived, assert passes.
+- stage0 ingest + detect_moons on injected subset: **moon detected in every exposure**
+  (centers ~(1982,2920), r~317) incl. the 0.0002s frame → registration will run at true scale.
+- mode-1 JPG `load_gray` is **bitwise-identical** to the legacy path.
+- NOT yet run: full stage0→3 on the 183-frame set (that is the user's manual test).
 
 ## Validation
 - mode jpg vs current outputs: compare `v2-stage3_*` artifacts (bitwise-ish).

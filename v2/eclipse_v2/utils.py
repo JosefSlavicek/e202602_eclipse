@@ -12,7 +12,14 @@ GRID_BATCH_SIZE = 4
 
 
 def load_grayscale(ii, device):
-    """Load an image file as a float32 grayscale tensor on `device`."""
+    """Load an image as a float32 [0,1] grayscale tensor, via the frame's input source.
+
+    Routes through `ii.source` (JpgSource / NefSource / NefInjectSource). Falls back to the
+    legacy JPG path when no source is attached, so the jpg mode stays safe even if a stage
+    forgets to re-attach the source after unpickling.
+    """
+    if getattr(ii, "source", None) is not None:
+        return ii.source.load_gray(ii, device)
     with Image.open(ii.path) as img:
         arr = np.array(img).astype(np.float32) / 255.0
     if arr.ndim == 3:

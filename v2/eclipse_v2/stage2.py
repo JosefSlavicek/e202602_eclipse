@@ -131,8 +131,14 @@ def cross_exposure_consecutive_pairs(
     moon_by_exp: dict,
     device: torch.device,
     pair_gif_dir: Path,
+    is_linear: bool = False,
 ) -> list:
-    """For each (t0,t1) consecutive in time: estimate gamma, register longer to shorter, refine; GIF."""
+    """For each (t0,t1) consecutive in time: estimate gamma, register longer to shorter, refine; GIF.
+
+    For linear (raw) inputs the physical scale is exactly t0/t1, so gamma is forced to 1.0 for
+    all scaling/registration; the fitted gamma is still computed and printed as a sanity check
+    (it should land near 1.0 on truly linear data).
+    """
     pairs_results = []
     for idx in range(len(exposure_times_sorted) - 1):
         t0 = exposure_times_sorted[idx]
@@ -145,13 +151,15 @@ def cross_exposure_consecutive_pairs(
         moon0 = moon_by_exp[t0]
         moon1 = moon_by_exp[t1]
 
-        gamma1 = estimate_gamma(img0, img1, moon0, moon1, t0, t1, device)
+        gamma1_meas = estimate_gamma(img0, img1, moon0, moon1, t0, t1, device)
+        gamma1 = 1.0 if is_linear else gamma1_meas
         scale1 = (t0 / t1) ** (1.0 / gamma1)
         img1_scaled1 = (img1 * scale1).clamp(0.0, 1.0)
         shift_i, shift_j, rotation = register_cross_exposure(img0, img1_scaled1, moon0, moon1, gamma1, t0, t1, device)
         del img1_scaled1
 
-        gamma2 = estimate_gamma(img0, img1, moon0, moon1, t0, t1, device, transform=(shift_i, shift_j, rotation))
+        gamma2_meas = estimate_gamma(img0, img1, moon0, moon1, t0, t1, device, transform=(shift_i, shift_j, rotation))
+        gamma2 = 1.0 if is_linear else gamma2_meas
         scale2 = (t0 / t1) ** (1.0 / gamma2)
         img1_scaled2 = (img1 * scale2).clamp(0.0, 1.0)
         del img1
@@ -183,7 +191,8 @@ def cross_exposure_consecutive_pairs(
         gif_path = pair_gif_dir / f"v2-stage2_pair_{t0:.5f}_{t1:.5f}_gamma{gamma2:.4f}.gif"
         frame0.save(gif_path, save_all=True, append_images=[frame1], duration=500, loop=0)
 
-        print(f"t0={t0:.5f} t1={t1:.5f} gamma={gamma2:.4f} -> {gif_path}")
+        print(f"t0={t0:.5f} t1={t1:.5f} gamma_used={gamma2:.4f} "
+              f"gamma_measured={gamma2_meas:.4f} (linear={is_linear}) -> {gif_path}")
 
     print(f"Processed {len(pairs_results)} consecutive pairs.")
     return pairs_results
@@ -200,7 +209,7 @@ def save_pickle(out_pkl: Path, pairs_results: list) -> Path:
     return out_pkl
 
 
-def run(stage1_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
+def run(stage1_pkl: Path, out_pkl: Path, pair_gif_dir: Path, is_linear: bool = False) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stage 2.")
     device = torch.device("cuda")
@@ -209,6 +218,6 @@ def run(stage1_pkl: Path, out_pkl: Path, pair_gif_dir: Path) -> Path:
     moon_by_exp, exposure_times_sorted = moon_median_table(exposure_groups)
     avg_images = fullsize_averages(exposure_groups, exposure_times_sorted, opt_results, device)
     pairs_results = cross_exposure_consecutive_pairs(
-        exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir
+        exposure_times_sorted, avg_images, moon_by_exp, device, pair_gif_dir, is_linear=is_linear
     )
     return save_pickle(out_pkl, pairs_results)
