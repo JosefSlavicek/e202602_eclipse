@@ -32,7 +32,7 @@ from PIL import Image
 
 # ---- hardcoded parameters -------------------------------------------------
 DATA_DIR = Path("/home/slavik/tmp/chipstate")
-N = 305               # number of .NEF files to sample
+N = 174               # number of .NEF files to sample
 F = 0.8              # fraction kept for pass 2 (lowest max-gradient frames)
 SEED = 42            # set to None for non-reproducible sampling
 MEDIAN_WINDOW = 5    # pass 0: same-color neighborhood window (odd; center excluded)
@@ -56,6 +56,12 @@ def load_nef_rgb(
     no_auto_bright keeps the per-image scaling consistent across frames (required
     for meaningful per-pixel aggregation); 16-bit output is normalized by 65535.
 
+    user_flip=0 disables the EXIF/maker-note orientation that postprocess() would
+    otherwise apply (default user_flip=-1), so every frame stays in the camera's
+    native sensor orientation regardless of how the camera was held. This keeps the
+    RGB output aligned photosite-for-photosite with raw_image_visible (Pass 0), which
+    is essential because the per-pixel aggregation maps fixed chip defects.
+
     If `wrong_mask` (a bool (H, W) tensor matching raw_image_visible) is given, the
     flagged photosites are repaired on the RAW Bayer array BEFORE demosaic, so the
     defect never propagates through interpolation or the gradient.
@@ -67,6 +73,7 @@ def load_nef_rgb(
             output_bps=16,
             no_auto_bright=True,
             use_camera_wb=True,
+            user_flip=0,  # no EXIF rotation: keep native sensor orientation, aligned to raw_image_visible
         )
     return rgb16.astype(np.float32) / 65535.0
 
