@@ -475,6 +475,122 @@ def _print_triplet_consistency(reg, exposure_time, group):
 
 ENABLE_STAGE_2 = False
 
+# Cap on images registered per exposure group. Groups with more frames are reduced to a
+# self-consistent MAX_IMG-subset (see _select_consistent_subset); groups with <= MAX_IMG
+# frames are registered in full, exactly as before.
+MAX_IMG = 5
+# A subset is "good enough" once its worst self-consistency discrepancy is <= this many px.
+SUBSET_THRESHOLD_PX = 0.5
+
+
+def _clean_group(group: list, device) -> tuple[list, list]:
+    """Load + polar/FFT-clean every image in a group once, sharing one anti-protuberance
+    threshold across the group (so the moon-limb step cancels consistently in every pair).
+    Returns (raws, cleans) where cleans[i] = (cleaned_cart, cart_mask)."""
+    raws = [load_grayscale(ii, device) for ii in group]
+    antiprot = None
+    cleans = []
+    for raw, ii in zip(raws, group):
+        cleaned_cart, cart_mask, antiprot = clean_polar_fft(
+            raw, ii.moon[:2], ii.moon[2], antiprot=antiprot
+        )
+        cleans.append((cleaned_cart, cart_mask))
+    return raws, cleans
+
+
+def _ensure_pair(pair_cache, group, cleans, a, b, device):
+    """Stage-1 grid-search transform mapping image b onto image a, memoised by (a, b)
+    index into `group`. A subset swap therefore only ever computes the genuinely new pairs."""
+    if (a, b) not in pair_cache:
+        initial_shift_half = _initial_shift_half(group[a], group[b])
+        target_cart, target_mask = cleans[a]
+        source_cart, source_mask = cleans[b]
+        pair_cache[(a, b)] = stage1_grid_search(
+            target_cart, target_mask, source_cart, source_mask, initial_shift_half, device
+        )
+    return pair_cache[(a, b)]
+
+
+def _residual_px(res_i, res_j, res_rot_deg, lever_px) -> float:
+    """Combine a translation+rotation residual into one pixel displacement. The rotation is
+    about the moon centre (the polar transform centre), so a rotation residual dtheta displaces
+    a point at radius `lever_px` by lever_px*dtheta. We use the moon radius as that lever: the
+    inner limb of the registered corona annulus (a lower bound on rotation-induced misalignment)."""
+    return max(abs(res_i), abs(res_j), lever_px * math.radians(abs(res_rot_deg)))
+
+
+def _subset_discrepancy(subset, pair_cache, lever_px) -> tuple[float, dict]:
+    """Self-consistency of a subset, in pixels. Discrepancy = max over (a) pair symmetry
+    (T(a,b) + T(b,a) should vanish) and (b) triplet closure (T(a,b)∘T(b,c) should equal
+    T(a,c)), each folded to px via _residual_px. Also returns a per-image score (sum of the
+    residual px of every check the image takes part in) used to pick the worst image."""
+    per_image = {i: 0.0 for i in subset}
+    max_disc = 0.0
+    for a, b in itertools.combinations(subset, 2):
+        rab, rba = pair_cache[(a, b)], pair_cache[(b, a)]
+        px = _residual_px(rab[0] + rba[0], rab[1] + rba[1], rab[2] + rba[2], lever_px)
+        per_image[a] += px
+        per_image[b] += px
+        max_disc = max(max_disc, px)
+    for a, b, c in itertools.permutations(subset, 3):
+        rab, rbc, rac = pair_cache[(a, b)], pair_cache[(b, c)], pair_cache[(a, c)]
+        comp = compose_transforms(rab[0], rab[1], rab[2], rbc[0], rbc[1], rbc[2])
+        px = _residual_px(comp[0] - rac[0], comp[1] - rac[1], comp[2] - rac[2], lever_px)
+        per_image[a] += px
+        per_image[b] += px
+        per_image[c] += px
+        max_disc = max(max_disc, px)
+    return max_disc, per_image
+
+
+def _initial_subset_indices(timestamps, k) -> list:
+    """k group indices spread evenly across the timestamp-sorted order (endpoints included),
+    so the starting subset is well distributed in time. Rounding collisions are filled in."""
+    order = sorted(range(len(timestamps)), key=lambda i: timestamps[i])
+    n = len(order)
+    picks = []
+    for t in range(k):
+        idx = order[round(t * (n - 1) / (k - 1))]
+        if idx not in picks:
+            picks.append(idx)
+    for idx in order:  # fill if rounding produced fewer than k distinct picks
+        if len(picks) >= k:
+            break
+        if idx not in picks:
+            picks.append(idx)
+    return picks
+
+
+def _select_consistent_subset(group, cleans, pair_cache, device, lever_px) -> list:
+    """Greedily find MAX_IMG group indices whose pairwise registration is self-consistent
+    to <= SUBSET_THRESHOLD_PX. Start from a time-spread subset; while it fails the gate,
+    drop the worst-scoring image and pull in the untried image closest in time to it. An
+    image is only ever pulled in once, so this terminates after at most (n - MAX_IMG) swaps;
+    if nothing passes, the smallest-discrepancy subset seen is returned."""
+    n = len(group)
+    timestamps = [ii.timestamp for ii in group]
+    subset = _initial_subset_indices(timestamps, MAX_IMG)
+    tried = set(subset)
+    best_subset, best_disc = None, float("inf")
+    while True:
+        for a, b in itertools.permutations(subset, 2):
+            _ensure_pair(pair_cache, group, cleans, a, b, device)
+        disc, per_image = _subset_discrepancy(subset, pair_cache, lever_px)
+        if disc < best_disc:
+            best_disc, best_subset = disc, list(subset)
+        if disc <= SUBSET_THRESHOLD_PX:
+            print(f"  subset {sorted(subset)} disc={disc:.4f}px <= {SUBSET_THRESHOLD_PX} (pass)")
+            return subset
+        untried = [i for i in range(n) if i not in tried]
+        if not untried:
+            print(f"  subset search exhausted; best {sorted(best_subset)} disc={best_disc:.4f}px")
+            return best_subset
+        worst = max(subset, key=lambda i: per_image[i])
+        repl = min(untried, key=lambda i: abs(timestamps[i] - timestamps[worst]))
+        print(f"  subset {sorted(subset)} disc={disc:.4f}px: drop {worst}, add {repl}")
+        subset = [i for i in subset if i != worst] + [repl]
+        tried.add(repl)
+
 
 def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
     """For each exposure, all ordered pairs: two-stage Fourier-style registration on GPU.
@@ -483,10 +599,14 @@ def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
     (Fix 3 in v1/perf_analysis_register_intra_exposure_pairs.md). Each image is loaded and
     cleaned once per group; the grid search then compares pre-cleaned cartesian tensors.
 
+    Subset capping: groups larger than MAX_IMG are reduced to a self-consistent MAX_IMG-subset
+    (_select_consistent_subset) before the reg dict is written; exposure_groups is mutated in
+    place to the kept frames so downstream sees a clean MAX_IMG-image group reindexed 0..k-1.
+
     Stage 2 (gated by ENABLE_STAGE_2): per-pair narrow-bracket finetune around Stage 1's
     result, using a common polar center C midway between the two moons. Cleanup re-runs
     per candidate around C; the moon-limb feature lands at near-identical (r, theta) in
-    both images so it cancels in the L1 diff.
+    both images so it cancels in the L1 diff. Applied only to the final kept pairs.
     """
     device = torch.device("cuda")
     reg = {}
@@ -497,30 +617,36 @@ def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
         if n < 2:
             print(f"  Skip (group size {n} < 2)")
             continue
-        raws = [load_grayscale(ii, device) for ii in group]
-        antiprot = None
-        cleans = []
-        for raw, ii in zip(raws, group):
-            cleaned_cart, cart_mask, antiprot = clean_polar_fft(
-                raw, ii.moon[:2], ii.moon[2], antiprot=antiprot
-            )
-            cleans.append((cleaned_cart, cart_mask))
-        tasks = [(i, j) for i, j in itertools.permutations(range(n), 2)]
-        for i, j in tqdm.tqdm(tasks, desc="Registration pairs"):
-            initial_shift_half = _initial_shift_half(group[i], group[j])
-            target_cart, target_mask = cleans[i]
-            source_cart, source_mask = cleans[j]
-            T1 = stage1_grid_search(
-                target_cart, target_mask, source_cart, source_mask, initial_shift_half, device
-            )
+        raws, cleans = _clean_group(group, device)
+        # Lever arm for folding a rotation residual into pixels: the moon radius (the polar/rotation
+        # centre is the moon centre, and moon_radius is the inner limb of the registered annulus).
+        # Near-constant across a group; average it so one outlier moon fit doesn't skew the gate.
+        lever_px = sum(ii.moon[2] for ii in group) / n
+        pair_cache = {}  # (a, b) index pair -> stage-1 transform, shared across selection + finalize
+
+        if n > MAX_IMG:
+            chosen = _select_consistent_subset(group, cleans, pair_cache, device, lever_px)
+        else:
+            chosen = list(range(n))
+        # Reindex kept frames in timestamp order so printed indices stay interpretable.
+        chosen = sorted(chosen, key=lambda a: group[a].timestamp)
+
+        final_group = [group[a] for a in chosen]
+        exposure_groups[exposure_time] = final_group
+        tasks = [
+            (new_i, new_j, chosen[new_i], chosen[new_j])
+            for new_i, new_j in itertools.permutations(range(len(chosen)), 2)
+        ]
+        for new_i, new_j, a, b in tqdm.tqdm(tasks, desc="Registration pairs"):
+            T1 = _ensure_pair(pair_cache, group, cleans, a, b, device)
             if ENABLE_STAGE_2:
-                T = stage2_finetune(raws[i], raws[j], group[i].moon, group[j].moon, T1, device)
+                T = stage2_finetune(raws[a], raws[b], group[a].moon, group[b].moon, T1, device)
             else:
                 T = T1
-            reg[(exposure_time, i, j)] = T
-        _print_pair_consistency(reg, exposure_time, group)
-        if n >= 3:
-            _print_triplet_consistency(reg, exposure_time, group)
+            reg[(exposure_time, new_i, new_j)] = T
+        _print_pair_consistency(reg, exposure_time, final_group)
+        if len(final_group) >= 3:
+            _print_triplet_consistency(reg, exposure_time, final_group)
     return reg
 
 
