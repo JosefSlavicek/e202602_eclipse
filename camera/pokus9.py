@@ -1,5 +1,6 @@
 import gphoto2 as gp
 import time
+import simpleaudio as sa
 
 last_vals = dict()
 t0 = []
@@ -85,6 +86,9 @@ def unlock_and_burst():
 
         print(f"Done. Check the card. {time.time()-t0[0]:.2f} s")
         print()
+        wave_obj = sa.WaveObject.from_wave_file("beep_1000hz_1s.wav")
+        play_obj = wave_obj.play()
+        play_obj.wait_done()
 
     finally:
         gp.gp_camera_exit(camera, context)
