@@ -66,17 +66,17 @@ def unlock_and_burst():
 
         do_burst('0.0020s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', True)
         do_burst('0.0015s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)#
-        do_burst('0.2500s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'no_repeat', False)
+        do_burst('0.1250s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'no_repeat', False)
         do_burst('0.0012s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)
 
         do_burst('0.1666s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
         do_burst('0.2000s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
 
-        do_burst('0.2500s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
+        do_burst('0.1250s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
         do_burst('0.1666s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
         do_burst('0.2000s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
 
-        do_burst('0.2500s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
+        do_burst('0.1250s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'double_in_two_runs', False)
         do_burst('0.2000s',   '1 EV', '5 images (normal, 2 unders and 2 overs)', 'no_repeat', False)
 
         do_burst('0.0012s',   '1 EV', '9 images (normal, 4 unders and 4 overs)', 'double_in_single_run', False)

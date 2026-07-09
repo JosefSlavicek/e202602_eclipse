@@ -32,11 +32,11 @@ from PIL import Image
 
 # ---- hardcoded parameters -------------------------------------------------
 DATA_DIR = Path("/home/slavik/tmp/chipstate")
-N = 174               # number of .NEF files to sample
+N = 62               # number of .NEF files to sample
 F = 0.8              # fraction kept for pass 2 (lowest max-gradient frames)
 SEED = 42            # set to None for non-reproducible sampling
 MEDIAN_WINDOW = 5    # pass 0: same-color neighborhood window (odd; center excluded)
-RESIDUAL_THRESHOLD = 100.0  # pass 0: raw-code units; flag pixels whose mean |residual| exceeds this
+RESIDUAL_THRESHOLD = 80.0  # pass 0: raw-code units; flag pixels whose mean |residual| exceeds this
 OUT_DIR = Path(__file__).resolve().parent
 MEAN_PATH = OUT_DIR / "test_chip_grad_mean.npy"
 STD_PATH = OUT_DIR / "test_chip_grad_std.npy"
