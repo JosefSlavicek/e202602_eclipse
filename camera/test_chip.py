@@ -160,9 +160,11 @@ def grad_magnitude(
 
 
 def main() -> None:
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA GPU required but not available.")
-    device = torch.device("cuda")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        print('Runing on CPU')
+        device = torch.device("cpu")
 
     nef_files = sorted(DATA_DIR.glob("*.NEF"))
     if len(nef_files) < N:
