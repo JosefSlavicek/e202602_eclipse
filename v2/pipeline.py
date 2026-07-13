@@ -47,6 +47,11 @@ def _parse_args():
                     default=Path(os.environ.get("ECLIPSE_V2_NEF_DIR", "/home/slavik/tmp/eclipse_fake_imgs")))
     ap.add_argument("--workdir", type=Path,
                     default=Path(os.environ.get("ECLIPSE_V2_WORKDIR", "/home/slavik/tmp/eclipse_v2_run")))
+    ap.add_argument("--exposure-group-subsample", type=int,
+                    default=int(os.environ.get("ECLIPSE_V2_EXPOSURE_GROUP_SUBSAMPLE", "1")),
+                    help="Keep ~1/N of the exposure groups (1=all, 2=~half, 3=~third, ...); "
+                         "shortest+longest always kept. Runtime knob for faster iteration, "
+                         "NOT a same-result speedup (widens cross-exposure gaps).")
     return ap.parse_args()
 
 
@@ -77,6 +82,8 @@ if __name__ == "__main__":
     print(f"Found {len(image_infos)} images, first: {image_infos[0].path}")
 
     exposure_groups = s0.group_by_exposure(image_infos)
+    exposure_groups = s0.subsample_exposure_groups(exposure_groups, args.exposure_group_subsample)
+    image_infos = [ii for group in exposure_groups.values() for ii in group]
 
     s0.detect_moons(image_infos)
     print("Exposure groups after moon detection:")

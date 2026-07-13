@@ -322,6 +322,36 @@ def group_by_exposure(image_infos: list) -> dict:
     return exposure_groups
 
 
+def subsample_exposure_groups(exposure_groups: dict, factor: int) -> dict:
+    """Keep ~1/`factor` of the exposure groups, evenly spaced across the exposure range.
+
+    `factor` is a positive integer (1 = keep every group). For factor > 1 roughly
+    (factor-1)/factor of the groups are dropped to speed up smoke / iteration runs
+    (factor=2 -> ~half, factor=3 -> ~a third, ...). The shortest and longest exposures
+    are always preserved so the full dynamic range is still spanned, and the survivors
+    are picked evenly in exposure-sorted order. Whole groups are dropped (never individual
+    frames), so downstream per-group invariants (MIN_GROUP_ELMS, pruning) are untouched.
+
+    NOTE: dropping middle groups widens the log-exposure gap between surviving neighbours,
+    which degrades the stage2 cross-exposure brightness/gamma fit. This is a runtime knob
+    for faster iteration, not a "same result, faster" switch.
+    """
+    if not isinstance(factor, int) or factor < 1:
+        raise ValueError(f"exposure-group subsample factor must be an int >= 1, got {factor!r}")
+    keys = sorted(exposure_groups.keys())
+    n = len(keys)
+    if factor == 1 or n <= 2:
+        return dict(exposure_groups)
+    keep_count = max(2, math.ceil(n / factor))  # >= 2 so both endpoints survive
+    idx = sorted({int(round(x)) for x in np.linspace(0, n - 1, keep_count)})
+    kept = {keys[i]: exposure_groups[keys[i]] for i in idx}
+    print(
+        f"Exposure-group subsample factor={factor}: kept {len(kept)}/{n} groups "
+        f"(exposures {[round(keys[i], 5) for i in idx]})"
+    )
+    return kept
+
+
 def prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
     """Drop moons that disagree with rolling reference radius (in-place)."""
     def radius(ii):
