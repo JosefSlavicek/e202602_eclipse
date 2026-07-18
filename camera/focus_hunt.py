@@ -67,6 +67,13 @@ AVG_FRAMES = 1          # full-res shots averaged per measurement (>=1); each is
 NOISE_MARGIN = 1.005    # a candidate must beat the best by this factor to win
                         #  (guards against chasing measurement noise)
 TOP_N = 300             # number of strongest-gradient pixels considered "edge"
+BRIGHT_RANK = 400       # merit is normalized by the value of the BRIGHT_RANK-th
+                        #  brightest pixel (a fixed-rank brightness scale). A
+                        #  FIXED rank -- not a percentile -- is deliberate: during
+                        #  the eclipse the bright area is a crescent whose FRACTION
+                        #  of the frame changes as occlusion progresses, so a
+                        #  percentile would drift; a fixed rank only needs ~this
+                        #  many bright pixels to exist anywhere in the crescent.
 BORDER_CROP = 8         # px cropped off each edge before the gradient metric
 MAX_MOVES = 400         # hard safety cap on total focus moves
 MAX_RETRY = 3           # camera-reset retries for idempotent operations
@@ -83,9 +90,17 @@ def focus_merit(bgr: np.ndarray) -> float:
     Grayscale the frame, take the Sobel gradient (d/dx, d/dy) and its magnitude.
     Keep the TOP_N pixels with the strongest gradient. A pixel is VALID iff it is
     in that top set AND at least two of its 8-neighbours are also in the top set
-    (isolated hot pixels / noise spikes therefore drop out). The merit is the
-    MINIMUM gradient magnitude over the valid pixels -- the weakest link of the
-    coherent strong-edge cluster, which rises as the border comes into focus.
+    (isolated hot pixels / noise spikes therefore drop out). We take the MINIMUM
+    gradient magnitude over the valid pixels -- the weakest link of the coherent
+    strong-edge cluster, which rises as the border comes into focus.
+
+    That raw minimum scales with the edge CONTRAST (disk brightness over the dark
+    background), so exposure / sky-transparency drift between shots would move it
+    for reasons unrelated to focus. We therefore NORMALIZE it by dividing by the
+    value of the BRIGHT_RANK-th brightest pixel -- a fixed-rank brightness scale
+    (see BRIGHT_RANK). Since Sobel is linear this is identical to running the
+    metric on a brightness-normalized image, and it leaves an exposure-invariant
+    "edge steepness as a fraction of contrast, per pixel".
 
     Returns 0.0 if no pixel survives the validity test (e.g. a blank frame).
     """
@@ -118,7 +133,16 @@ def focus_merit(bgr: np.ndarray) -> float:
     valid = top & (neigh >= 2)
     if not valid.any():
         return 0.0
-    return float(mag[valid].min())
+    min_grad = float(mag[valid].min())
+
+    # Fixed-rank brightness scale: the value of the BRIGHT_RANK-th brightest
+    # pixel of the (cropped) grayscale. Guarded against a dark/blank frame.
+    gflat = gray.ravel()
+    if gflat.size >= BRIGHT_RANK:
+        scale = float(np.partition(gflat, -BRIGHT_RANK)[-BRIGHT_RANK])
+    else:
+        scale = float(gflat.max())
+    return min_grad / max(scale, 1e-6)
 
 
 class FocusCamera:
@@ -313,7 +337,8 @@ class FocusCamera:
         stem, ext = os.path.splitext(name)
         # zero-padded merit so a plain lexicographic sort orders by sharpness;
         # pos and original stem keep each frame traceable, seq avoids collisions.
-        out = (f"merit_{value:012.3f}_pos{self.pos:+06d}_"
+        # merit is now a small normalized ratio, so keep several decimals.
+        out = (f"merit_{value:010.6f}_pos{self.pos:+06d}_"
                f"{stem}_{self.saved_captures:03d}{ext}")
         try:
             with open(out, "wb") as f:
