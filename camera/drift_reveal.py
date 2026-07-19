@@ -32,10 +32,13 @@ import cv2
 import gphoto2 as gp
 
 # ---- tunable parameters ---------------------------------------------------
-TOGGLE_S = 1.0          # seconds each of first/last is shown before flipping
+FIRST_S = 1.0           # seconds the frozen "first" frame is shown per cycle
+LAST_S = 3.0            # seconds the current "last" frame is shown per cycle
 MAX_RETRY = 3           # camera-reset retries for the (idempotent) preview grab
-FONT_SCALE = 0.28       # ~1/3 of focus_hunt's 0.8 -- small corner label
-LABEL_ORG = (8, 22)     # top-left anchor of the label text
+FONT_SCALE = 0.84       # 3x the old small corner label
+LABEL_ORG = (8, 40)     # top-left anchor of the label text
+COLOR_FIRST = (0, 255, 0)   # green (BGR) for the "first" frame
+COLOR_LAST = (0, 0, 255)    # red (BGR) for the "last" frame
 
 WINDOW = "Drift Reveal (filtered Sun)"
 
@@ -140,13 +143,13 @@ class DriftCamera:
         raise RuntimeError("preview capture failed after retries")
 
 
-def _draw_label(bgr: np.ndarray, text: str) -> np.ndarray:
-    """Return a copy of `bgr` with a small label in the top-left corner."""
+def _draw_label(bgr: np.ndarray, text: str, color) -> np.ndarray:
+    """Return a copy of `bgr` with a label in the top-left corner."""
     vis = bgr.copy()
     cv2.putText(vis, text, LABEL_ORG, cv2.FONT_HERSHEY_SIMPLEX,
-                FONT_SCALE, (0, 0, 0), 2, cv2.LINE_AA)
+                FONT_SCALE, (0, 0, 0), 6, cv2.LINE_AA)
     cv2.putText(vis, text, LABEL_ORG, cv2.FONT_HERSHEY_SIMPLEX,
-                FONT_SCALE, (0, 255, 0), 1, cv2.LINE_AA)
+                FONT_SCALE, color, 3, cv2.LINE_AA)
     return vis
 
 
@@ -169,14 +172,17 @@ def run(cam: DriftCamera) -> None:
             first, t_first = img, now
         last, t_last = img, now
 
-        if now - last_toggle >= TOGGLE_S:
+        dwell = FIRST_S if show_first else LAST_S
+        if now - last_toggle >= dwell:
             show_first = not show_first
             last_toggle = now
             print(f"elapsed first->last: {t_last - t_first:.1f} s")
 
-        frame = first if show_first else last
-        label = "first" if show_first else "last"
-        cv2.imshow(WINDOW, _draw_label(frame, label))
+        if show_first:
+            frame, label, color = first, "first", COLOR_FIRST
+        else:
+            frame, label, color = last, "last", COLOR_LAST
+        cv2.imshow(WINDOW, _draw_label(frame, label, color))
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
