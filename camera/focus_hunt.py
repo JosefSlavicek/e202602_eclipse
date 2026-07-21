@@ -47,6 +47,7 @@ camera), e.g.:
 """
 from __future__ import annotations
 
+import argparse
 import time
 import sys
 
@@ -121,6 +122,31 @@ def focus_merit(bgr: np.ndarray) -> float:
     return float(mag[valid].min())
 
 
+def focus_merit_laplacian(bgr: np.ndarray) -> float:
+    """Laplacian variance -- standard optical autofocus figure of merit.
+
+    Applies the discrete Laplacian (second spatial derivative) to the
+    grayscale frame and returns the variance of the result.  Sharp edges
+    produce large second-derivative values; the variance therefore rises
+    monotonically as the image comes into focus.
+
+    Particularly well-suited to solar / eclipse images: the hard limb of
+    the solar disk and the silhouette of the moon both generate strong,
+    localised Laplacian responses that increase rapidly with focus quality.
+    Being a difference operator the metric is insensitive to overall frame
+    brightness, so it needs no normalisation for illumination variation.
+    """
+    if bgr.ndim == 3:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    else:
+        gray = bgr.astype(np.float64)
+    c = BORDER_CROP
+    if gray.shape[0] > 2 * c and gray.shape[1] > 2 * c:
+        gray = gray[c:-c, c:-c]
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(lap.var())
+
+
 class FocusCamera:
     """gphoto2 camera wrapper with self-healing (re-init on error) operations."""
 
@@ -131,6 +157,8 @@ class FocusCamera:
         self.headless = False        # set True if no display for cv2 windows
         self.saved_frames = 0        # headless overlay PNGs written
         self.saved_captures = 0      # raw camera files saved to cwd
+        self.current_round = 0       # 0 = baseline; increments each step-halving
+        self.metric = "custom"       # "custom" | "normalized" | "laplacian"
 
     # -- lifecycle ---------------------------------------------------------
     def open(self) -> None:
@@ -190,6 +218,23 @@ class FocusCamera:
                     self.reset()
         print(f"[warn] giving up on set {name}={value}; continuing")
         return False
+
+    def _normalize_merit(self, bgr: np.ndarray, merit: float) -> float:
+        """Divide merit by the 400th brightest pixel value of the frame.
+
+        Compensates for exposure / brightness variation between frames so that
+        sharpness comparisons are not confused by illumination differences.
+        Returns `merit` unchanged if the image is too small or the reference
+        pixel is zero (avoids division by zero on a blank frame).
+        """
+        gray = (cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3
+                else bgr).ravel().astype(np.float64)
+        if gray.size < 400:
+            return merit
+        ref = float(np.partition(gray, -400)[-400])
+        if ref == 0.0:
+            return merit
+        return merit / ref
 
     def start_liveview(self) -> None:
         # Hand PC control to the camera logic and raise the mirror into live
@@ -253,13 +298,17 @@ class FocusCamera:
         raise RuntimeError("image capture failed after retries")
 
     # -- focus drive -------------------------------------------------------
-    def drive_focus(self, delta: int) -> None:
+    def drive_focus(self, delta: int, strict: bool = False) -> None:
         """Move focus RELATIVELY by `delta` units, split into safe chunks.
 
-        A chunk that errors is NOT retried (the motor may have moved a partial,
-        unknown amount): we reset the camera, assume the chunk did not move,
-        drop it from the tracked position, and continue. The closed-loop hunt
-        corrects any resulting small offset on the next measurement.
+        In normal mode (strict=False) a failed chunk is NOT retried (the motor
+        may have moved a partial, unknown amount): we reset the camera, assume
+        the chunk did not move, drop it from the tracked position, and continue.
+        The closed-loop hunt corrects any resulting small offset on the next
+        measurement.
+
+        In strict mode (strict=True) any failure raises RuntimeError so the
+        caller knows the final position was not reached.
         """
         if delta == 0:
             return
@@ -271,19 +320,43 @@ class FocusCamera:
                 self._set_config("manualfocusdrive", move)
                 self.pos += move
             except Exception as e:
-                print(f"[warn] focus drive {move} failed: {e} "
-                      f"(assuming no move; resetting)")
-                self.reset()
+                # -110 = GP_ERROR_CAMERA_BUSY: the command was fully rejected,
+                # the motor provably did not move, so retrying is safe.
+                is_busy = (isinstance(e, AssertionError) and e.args
+                           and e.args[-1] == -110)
+                if is_busy:
+                    print(f"[warn] focus drive {move} busy (-110); "
+                          f"waiting 1 s and retrying")
+                    time.sleep(1.0)
+                    try:
+                        self._set_config("manualfocusdrive", move)
+                        self.pos += move
+                    except Exception as e2:
+                        if strict:
+                            raise RuntimeError(
+                                f"final focus move chunk {move} failed after "
+                                f"busy-retry: {e2}") from e2
+                        print(f"[warn] focus drive {move} retry failed: {e2} "
+                              f"(assuming no move; resetting)")
+                        self.reset()
+                else:
+                    if strict:
+                        raise RuntimeError(
+                            f"final focus move chunk {move} failed: {e}") from e
+                    print(f"[warn] focus drive {move} failed: {e} "
+                          f"(assuming no move; resetting)")
+                    self.reset()
             remaining -= abs(move)
             time.sleep(MOVE_PAUSE)
 
-    def move_to(self, target_pos: int, reversing: bool = False) -> None:
+    def move_to(self, target_pos: int, reversing: bool = False,
+                strict: bool = False) -> None:
         """Drive to an absolute (tracked) position from the current position."""
         if reversing and BACKLASH:
             # take up slack in the new direction, then approach the target
             direction = 1 if target_pos > self.pos else -1
-            self.drive_focus(direction * BACKLASH)
-        self.drive_focus(target_pos - self.pos)
+            self.drive_focus(direction * BACKLASH, strict=strict)
+        self.drive_focus(target_pos - self.pos, strict=strict)
 
     # -- measurement + display --------------------------------------------
     def measure(self, label: str) -> float:
@@ -299,12 +372,21 @@ class FocusCamera:
         last = None
         for _ in range(max(1, AVG_FRAMES)):
             img, raw, name = self.capture_image()
-            value = focus_merit(img)
+            if self.metric == "laplacian":
+                value = focus_merit_laplacian(img)
+            else:
+                value = focus_merit(img)
+                if self.metric == "normalized":
+                    value = self._normalize_merit(img, value)
             scores.append(value)
             last = img
             self._save_capture(raw, name, value)
         sharp = float(np.mean(scores))
         self._show(last, label, sharp)
+        # Give the camera time to fully resume live view after the shutter
+        # fired; without this pause the next manualfocusdrive arrives while
+        # the camera is still transitioning and returns GP_ERROR_CAMERA_BUSY.
+        time.sleep(1.0)
         return sharp
 
     def _save_capture(self, raw: bytes, name: str, value: float) -> None:
@@ -313,7 +395,7 @@ class FocusCamera:
         stem, ext = os.path.splitext(name)
         # zero-padded merit so a plain lexicographic sort orders by sharpness;
         # pos and original stem keep each frame traceable, seq avoids collisions.
-        out = (f"merit_{value:012.3f}_pos{self.pos:+06d}_"
+        out = (f"round{self.current_round:02d}_merit_{value:012.3f}_pos{self.pos:+06d}_"
                f"{stem}_{self.saved_captures:03d}{ext}")
         try:
             with open(out, "wb") as f:
@@ -353,43 +435,104 @@ def hunt(cam: FocusCamera) -> None:
 
     # Baseline at the starting (infinity) position.
     best_pos = 0
+    cam.current_round = 0
     best_sharp = cam.measure("start (infinity)")
     print(f"[baseline] pos={best_pos} value={best_sharp:.3f}")
 
     step = INITIAL_STEP
     pref = -1  # probe the NEGATIVE direction first (away from infinity)
+    round_num = 1
 
     while step >= MIN_STEP:
-        improved = True
-        while improved and moves_used < MAX_MOVES:
-            improved = False
-            # Try the preferred direction first, then the opposite.
-            for d in (pref, -pref):
-                cand = best_pos + d * step
-                reversing = (d != pref)
-                cam.move_to(cand, reversing=reversing)
-                moves_used += 1
-                sharp = cam.measure(
-                    f"step={step} dir={'+' if d > 0 else '-'} "
-                    f"cand={cand}"
-                )
-                better = sharp > best_sharp * NOISE_MARGIN
-                print(f"[hunt] step={step:<4d} dir={'+' if d > 0 else '-'} "
-                      f"pos={cand:<6d} value={sharp:<12.3f} "
-                      f"best={best_sharp:.3f}@{best_pos} "
-                      f"{'<-- new best' if better else ''}")
-                if better:
-                    best_sharp, best_pos, pref = sharp, cand, d
-                    improved = True
-                    break  # keep marching in this direction at this step size
-            if moves_used >= MAX_MOVES:
-                print("[warn] hit MAX_MOVES safety cap; stopping hunt")
+        # Re-measure best_pos fresh at the start of each round so the
+        # comparison threshold reflects current conditions, not a stale
+        # reading from a coarser pass.
+        cam.current_round = round_num
+        cam.move_to(best_pos)
+        best_sharp = cam.measure(f"round {round_num} start (step={step})")
+        print(f"[round {round_num}] re-measured pos={best_pos} "
+              f"value={best_sharp:.3f} step={step}")
+
+        # probed: all positions measured so far this round mapped to their merit.
+        # Misses are counted globally (all positions above/below current best_pos
+        # that were measured and lost), so history is never wiped when best_pos
+        # changes.  This prevents both re-probing already-measured positions and
+        # the "best_pos bounce resets all history" bug.
+        probed: dict[int, float] = {best_pos: best_sharp}
+        # Track raw best (ignoring NOISE_MARGIN) to correct best_pos at round end.
+        raw_best_pos, raw_best_sharp = best_pos, best_sharp
+
+        while moves_used < MAX_MOVES:
+            # Misses on each side = probed positions that are not the current
+            # best and whose merit did not beat best_sharp * NOISE_MARGIN.
+            misses_above = sum(1 for p, m in probed.items()
+                               if p > best_pos
+                               and m <= best_sharp * NOISE_MARGIN)
+            misses_below = sum(1 for p, m in probed.items()
+                               if p < best_pos
+                               and m <= best_sharp * NOISE_MARGIN)
+            if misses_above >= 2 and misses_below >= 2:
                 break
-        print(f"[hunt] step {step} exhausted; best={best_sharp:.3f}@{best_pos}")
+
+            # Pick side with fewer misses; tie-break by pref direction.
+            if misses_above >= 2:
+                d = -1
+            elif misses_below >= 2:
+                d = 1
+            elif misses_above < misses_below:
+                d = 1
+            elif misses_below < misses_above:
+                d = -1
+            else:
+                d = pref
+
+            # Find nearest position in direction d not yet measured this round.
+            k = 1
+            while (best_pos + d * k * step) in probed:
+                k += 1
+            cand = best_pos + d * k * step
+
+            reversing = (d != pref)
+            cam.move_to(cand, reversing=reversing)
+            moves_used += 1
+            sharp = cam.measure(
+                f"round={round_num} step={step} dir={'+' if d > 0 else '-'} "
+                f"cand={cand}"
+            )
+            probed[cand] = sharp
+            if sharp > raw_best_sharp:
+                raw_best_pos, raw_best_sharp = cand, sharp
+
+            better = sharp > best_sharp * NOISE_MARGIN
+            print(f"[hunt] round={round_num} step={step:<4d} "
+                  f"dir={'+' if d > 0 else '-'} "
+                  f"pos={cand:<6d} value={sharp:<12.3f} "
+                  f"best={best_sharp:.3f}@{best_pos} "
+                  f"ma={misses_above} mb={misses_below} "
+                  f"{'<-- new best' if better else ''}")
+            if better:
+                best_sharp, best_pos, pref = sharp, cand, d
+
+        if moves_used >= MAX_MOVES:
+            print("[warn] hit MAX_MOVES safety cap; stopping hunt")
+
+        # If NOISE_MARGIN prevented the raw merit winner from being tracked,
+        # correct best_pos now so the next round starts from the right place.
+        if raw_best_pos != best_pos:
+            print(f"[hunt] round {round_num}: raw-best correction "
+                  f"{best_pos}({best_sharp:.3f}) -> "
+                  f"{raw_best_pos}({raw_best_sharp:.3f})")
+            best_pos, best_sharp = raw_best_pos, raw_best_sharp
+        print(f"[hunt] round {round_num} (step={step}) exhausted; "
+              f"best={best_sharp:.3f}@{best_pos}")
         step //= 2
+        round_num += 1
 
     # Settle exactly on the best position (approach with backlash comp if set).
-    cam.move_to(best_pos, reversing=True)
+    # strict=True: any chunk failure raises immediately rather than silently
+    # skipping -- we must know if the lens did not reach the target.
+    cam.current_round = round_num
+    cam.move_to(best_pos, reversing=True, strict=True)
     final = cam.measure(f"FINAL pos={best_pos}")
     print("=" * 60)
     print(f"FINAL focus position = {best_pos} steps from infinity")
@@ -404,7 +547,26 @@ def hunt(cam: FocusCamera) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Auto-hunt optimal focus of the filtered Sun via full-res shots.")
+    parser.add_argument(
+        "--metric", choices=["custom", "normalized", "laplacian"],
+        default="custom",
+        help=(
+            "Sharpness metric used for focus decisions (default: custom). "
+            "'custom': edge-cluster minimum over top-N Sobel gradient pixels "
+            "(coherent-edge focus, noise-spike resistant). "
+            "'normalized': same divided by the 400th brightest pixel value "
+            "(compensates for exposure variation between frames). "
+            "'laplacian': Laplacian variance -- standard optical autofocus metric, "
+            "well-suited to solar/eclipse images with hard limb edges; "
+            "insensitive to overall brightness changes."
+        ))
+    args = parser.parse_args()
+
     cam = FocusCamera()
+    cam.metric = args.metric
+    print(f"[info] sharpness metric: {args.metric}")
     try:
         cam.open()
         cam.start_liveview()
