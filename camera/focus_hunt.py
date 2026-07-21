@@ -74,6 +74,32 @@ MAX_RETRY = 3           # camera-reset retries for idempotent operations
 BACKLASH = 0            # extra units to take up mechanical slack on reversal
                         #  (0 = disabled; raise if reversals read soft)
 
+# ---- 'radius' metric parameters -------------------------------------------
+EXPECTED_RADIUS = 320   # px, expected solar-disk radius in the frame
+RADIUS_KEEP = int(round(2 * 2 * np.pi * EXPECTED_RADIUS))  # ~4021 strongest
+                        #  edge pixels kept for circle-fitting (a few * limb
+                        #  circumference so the whole limb is represented)
+CIRCUMCENTER_MAX_DIST = 500  # px, a triplet's circumcircle centre must lie
+                        #  within this of the image centre to be valid
+MIN_PAIR_DIST = 100     # px, every pair of a triplet's 3 points must be at
+                        #  least this far apart (spreads points around the limb)
+RADIUS_COS_MIN = 0.5    # min cosine between (point->circumcentre) and the
+                        #  gradient-toward-higher-intensity (=> within ~60 deg;
+                        #  the limb gradient must point inward, at the centre)
+RADIUS_N_VALID = 1024   # valid triplets collected before scoring
+RADIUS_TOP_SCORE = 128  # highest-score valids whose radii are averaged
+RADIUS_SAMPLE_BATCH = 4096   # triplets evaluated per vectorised batch
+DEFAULT_MAX_SAMPLES = 128 * 1024  # crash if this many samples fail to yield
+                        #  RADIUS_N_VALID valid triplets (cmdline overridable)
+COLLINEAR_EPS = 1e-6    # |2*signed-area| below this => collinear, reject early
+
+# ---- auto-exposure (for the 'radius' metric) ------------------------------
+CLIP_VALUE = 250        # a grayscale pixel at/above this counts as saturated
+CLIP_ONSET_FRAC = 5e-4  # frame fraction saturated that marks "clipping began"
+OVEREXPOSE_STOPS = 2.0  # default stops PAST onset to expose (~4x; the ~over=4
+                        #  regime that made the radius metric focus-sensitive)
+BASE_ISO = "100"        # ISO held during auto-exposure (base = least noise)
+
 WINDOW = "Focus Hunt (filtered Sun)"
 PNG_DIR = "focus_hunt"  # only used if there is no display (headless fallback)
 
@@ -147,6 +173,151 @@ def focus_merit_laplacian(bgr: np.ndarray) -> float:
     return float(lap.var())
 
 
+def focus_merit_radius(bgr: np.ndarray,
+                       max_samples: int = DEFAULT_MAX_SAMPLES) -> float:
+    """Circle-fit figure of merit -- averages the fitted solar-disk radius.
+
+    Rationale: the filtered Sun is a bright disk whose sharp limb, when in
+    focus, fits a tight circle; a blurred / bloomed limb reads as a LARGER
+    apparent radius. We therefore estimate the disk radius by fitting circles
+    to random triplets of strong-gradient limb pixels and return a merit that
+    RISES as that radius shrinks (sharper focus).
+
+    Steps:
+      1. Sobel gradient of the grayscale; keep the RADIUS_KEEP pixels with the
+         strongest magnitude, remembering position, gradient vector (gx, gy)
+         -- which points toward higher intensity -- and magnitude.
+      2. Draw random triplets. A triplet is VALID iff:
+           * its circumcircle centre lies within CIRCUMCENTER_MAX_DIST of the
+             image centre,
+           * for each point, the cosine between (point->circumcentre) and its
+             gradient exceeds RADIUS_COS_MIN (gradient points inward),
+           * all three pairwise distances exceed MIN_PAIR_DIST.
+         Near-collinear triplets are rejected up front via the circumcentre
+         denominator (twice the signed triangle area) to avoid blow-up.
+      3. For each valid triplet record score = min of its 3 gradient
+         magnitudes, and radius = circumradius.
+      4. Collect RADIUS_N_VALID valid triplets (crashing if max_samples is
+         exhausted first), average the radii of the RADIUS_TOP_SCORE
+         highest-score ones, and return 1000 / (avg_radius + 1).
+    """
+    if bgr.ndim == 3:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    else:
+        gray = bgr.astype(np.float64)
+    c = BORDER_CROP
+    if gray.shape[0] > 2 * c and gray.shape[1] > 2 * c:
+        gray = gray[c:-c, c:-c]
+
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+    H, W = mag.shape
+
+    flat = mag.ravel()
+    n_keep = min(RADIUS_KEEP, flat.size)
+    keep = np.argpartition(flat, -n_keep)[-n_keep:]
+    xs = (keep % W).astype(np.float64)
+    ys = (keep // W).astype(np.float64)
+    gxs = gx.ravel()[keep]
+    gys = gy.ravel()[keep]
+    mags = flat[keep]
+    cx0 = (W - 1) / 2.0
+    cy0 = (H - 1) / 2.0
+    n = n_keep
+
+    scores: list[float] = []
+    radii: list[float] = []
+    samples_done = 0
+    min_pair_sq = float(MIN_PAIR_DIST) ** 2
+    center_sq = float(CIRCUMCENTER_MAX_DIST) ** 2
+
+    while len(scores) < RADIUS_N_VALID:
+        if samples_done >= max_samples:
+            raise RuntimeError(
+                f"radius metric: only {len(scores)}/{RADIUS_N_VALID} valid "
+                f"triplets after {samples_done} samples "
+                f"(budget {max_samples}); giving up")
+        b = min(RADIUS_SAMPLE_BATCH, max_samples - samples_done)
+        i1 = np.random.randint(0, n, b)
+        i2 = np.random.randint(0, n, b)
+        i3 = np.random.randint(0, n, b)
+        samples_done += b
+
+        x1, y1 = xs[i1], ys[i1]
+        x2, y2 = xs[i2], ys[i2]
+        x3, y3 = xs[i3], ys[i3]
+
+        # all three pairwise distances must exceed MIN_PAIR_DIST
+        ok = (((x1 - x2) ** 2 + (y1 - y2) ** 2) > min_pair_sq)
+        ok &= (((x2 - x3) ** 2 + (y2 - y3) ** 2) > min_pair_sq)
+        ok &= (((x3 - x1) ** 2 + (y3 - y1) ** 2) > min_pair_sq)
+
+        # circumcentre denominator = 2 * signed triangle area; ~0 => collinear
+        d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+        ok &= np.abs(d) > COLLINEAR_EPS
+
+        d_safe = np.where(ok, d, 1.0)  # avoid div-by-zero; masked out below
+        s1 = x1 * x1 + y1 * y1
+        s2 = x2 * x2 + y2 * y2
+        s3 = x3 * x3 + y3 * y3
+        ux = (s1 * (y2 - y3) + s2 * (y3 - y1) + s3 * (y1 - y2)) / d_safe
+        uy = (s1 * (x3 - x2) + s2 * (x1 - x3) + s3 * (x2 - x1)) / d_safe
+
+        # circumcentre within CIRCUMCENTER_MAX_DIST of the image centre
+        ok &= (((ux - cx0) ** 2 + (uy - cy0) ** 2) <= center_sq)
+
+        # each point's gradient must point toward the circumcentre:
+        # cos(v, g) > t  <=>  dot(v, g) > t * |v| * |g|   (t > 0)
+        for xp, yp, gxp, gyp in (
+            (x1, y1, gxs[i1], gys[i1]),
+            (x2, y2, gxs[i2], gys[i2]),
+            (x3, y3, gxs[i3], gys[i3]),
+        ):
+            vx = ux - xp
+            vy = uy - yp
+            dot = vx * gxp + vy * gyp
+            vg = np.sqrt(vx * vx + vy * vy) * np.sqrt(gxp * gxp + gyp * gyp)
+            ok &= dot > RADIUS_COS_MIN * vg
+
+        if ok.any():
+            r = np.sqrt((ux[ok] - x1[ok]) ** 2 + (uy[ok] - y1[ok]) ** 2)
+            sc = np.minimum(np.minimum(mags[i1][ok], mags[i2][ok]),
+                            mags[i3][ok])
+            scores.extend(sc.tolist())
+            radii.extend(r.tolist())
+
+    # keep exactly RADIUS_N_VALID (last batch may overshoot; order is random)
+    scores_a = np.asarray(scores[:RADIUS_N_VALID])
+    radii_a = np.asarray(radii[:RADIUS_N_VALID])
+    k = min(RADIUS_TOP_SCORE, scores_a.size)
+    top = np.argpartition(scores_a, -k)[-k:]
+    avg_radius = float(radii_a[top].mean())
+    merit = 1000.0 / (avg_radius + 1.0)
+    print(f"[radius] {samples_done} samples -> {len(scores)} valid triplets; "
+          f"avg top-{k} radius={avg_radius:.2f} merit={merit:.4f}")
+    return merit
+
+
+def parse_shutter_seconds(s: str) -> float | None:
+    """Parse a gphoto2 shutter-speed choice into seconds.
+
+    Handles the two numeric forms Nikon reports -- fractions like '1/2000'
+    and decimals like '0.5' or '1.3' (an optional trailing 's' is tolerated).
+    Non-numeric choices (e.g. 'Bulb', 'Time') return None so the caller can
+    drop them from the searchable range.
+    """
+    s = s.strip().rstrip("s").strip()
+    try:
+        if "/" in s:
+            num, den = s.split("/")
+            den = float(den)
+            return float(num) / den if den else None
+        return float(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
 class FocusCamera:
     """gphoto2 camera wrapper with self-healing (re-init on error) operations."""
 
@@ -158,7 +329,8 @@ class FocusCamera:
         self.saved_frames = 0        # headless overlay PNGs written
         self.saved_captures = 0      # raw camera files saved to cwd
         self.current_round = 0       # 0 = baseline; increments each step-halving
-        self.metric = "custom"       # "custom" | "normalized" | "laplacian"
+        self.metric = "custom"       # custom|normalized|laplacian|radius
+        self.max_samples = DEFAULT_MAX_SAMPLES  # 'radius' triplet-sample budget
 
     # -- lifecycle ---------------------------------------------------------
     def open(self) -> None:
@@ -218,6 +390,104 @@ class FocusCamera:
                     self.reset()
         print(f"[warn] giving up on set {name}={value}; continuing")
         return False
+
+    def get_config_choices(self, name: str) -> list[str]:
+        """Read the list of allowed values for a radio/menu config leaf."""
+        for attempt in range(MAX_RETRY + 1):
+            try:
+                err, config = gp.gp_camera_get_config(self.camera, self.context)
+                assert err == gp.GP_OK, ("get_config", err)
+                err, child = gp.gp_widget_get_child_by_name(config, name)
+                assert err == gp.GP_OK, ("get_child", name, err)
+                count = gp.gp_widget_count_choices(child)
+                if isinstance(count, tuple):  # some bindings return (err, n)
+                    count = count[1]
+                out = []
+                for i in range(count):
+                    res = gp.gp_widget_get_choice(child, i)
+                    out.append(res[1] if isinstance(res, tuple) else res)
+                return out
+            except Exception as e:
+                print(f"[warn] read choices {name} failed "
+                      f"(try {attempt + 1}/{MAX_RETRY + 1}): {e}")
+                if attempt < MAX_RETRY:
+                    self.reset()
+        raise RuntimeError(f"could not read config choices for {name}")
+
+    def auto_expose_to_clip(self, overexpose_stops: float = OVEREXPOSE_STOPS,
+                            iso: str = BASE_ISO) -> str:
+        """Pick a shutter speed that saturates the disk core, for 'radius'.
+
+        The radius metric only tracks focus when the bright disk clips (a
+        symmetric, unclipped limb is focus-insensitive -- see module notes).
+        We therefore hold the camera at base ISO and a fixed aperture and drive
+        the SHUTTER to a deliberate overexposure:
+
+          1. Scan the available shutter speeds from fastest toward slowest and
+             stop at the first one where at least CLIP_ONSET_FRAC of the frame
+             is saturated -- the clipping "onset".
+          2. Multiply that exposure by 2**overexpose_stops (default 2 stops =>
+             ~4x, the regime we validated) and set the nearest available speed.
+
+        Aperture is left untouched (yours to choose -- it sets depth of field);
+        only ISO and shutter are managed here. Exposure-mode is nudged to
+        Manual best-effort, but on bodies where the mode dial is mechanical
+        that set is a harmless no-op, so put the camera in M yourself.
+
+        Returns the shutter-speed string it settled on. Raises RuntimeError if
+        even the slowest available speed cannot reach the clipping onset (disk
+        too dim -- open the aperture or raise ISO).
+        """
+        # Best-effort manual mode + base ISO; aperture stays as the user set it.
+        self.set_config_guarded("expprogram", "M")
+        self.set_config_guarded("iso", iso)
+
+        cand = []
+        for c in self.get_config_choices("shutterspeed"):
+            secs = parse_shutter_seconds(c)
+            if secs is not None and secs > 0:
+                cand.append((secs, c))
+        if not cand:
+            raise RuntimeError("auto-expose: no numeric shutter speeds found")
+        cand.sort()  # ascending seconds: fastest (least light) -> slowest
+        secs = [s for s, _ in cand]
+        vals = [v for _, v in cand]
+
+        def clip_frac(idx: int) -> float:
+            self.set_config_guarded("shutterspeed", vals[idx])
+            time.sleep(SETTLE_S)
+            img, _, _ = self.capture_image()
+            gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    if img.ndim == 3 else img)
+            return float((gray >= CLIP_VALUE).mean())
+
+        # Scan up from the fastest speed; stop at clipping onset. Starting fast
+        # keeps every probe exposure short and avoids firing a multi-second one.
+        onset = None
+        for i in range(len(vals)):
+            frac = clip_frac(i)
+            print(f"[auto-expose] probe {vals[i]}s "
+                  f"({secs[i] * 1000:.3f} ms): clipped {frac * 100:.3f}%")
+            if frac >= CLIP_ONSET_FRAC:
+                onset = i
+                break
+        if onset is None:
+            raise RuntimeError(
+                f"auto-expose: even {vals[-1]}s does not reach the clipping "
+                f"onset ({CLIP_ONSET_FRAC * 100:.3f}% of frame). Open the "
+                f"aperture or raise ISO -- the disk is too dim to saturate.")
+
+        target = secs[onset] * (2.0 ** overexpose_stops)
+        pick = min(range(len(secs)), key=lambda i: abs(secs[i] - target))
+        clamped = " (clamped to slowest available)" if secs[pick] < target \
+            and pick == len(secs) - 1 else ""
+        frac = clip_frac(pick)
+        print(f"[auto-expose] onset={vals[onset]}s "
+              f"({secs[onset] * 1000:.3f} ms); +{overexpose_stops} stops -> "
+              f"target {target * 1000:.3f} ms; set {vals[pick]}s "
+              f"({secs[pick] * 1000:.3f} ms){clamped}; "
+              f"frame now clipped {frac * 100:.2f}%")
+        return vals[pick]
 
     def _normalize_merit(self, bgr: np.ndarray, merit: float) -> float:
         """Divide merit by the 400th brightest pixel value of the frame.
@@ -374,6 +644,8 @@ class FocusCamera:
             img, raw, name = self.capture_image()
             if self.metric == "laplacian":
                 value = focus_merit_laplacian(img)
+            elif self.metric == "radius":
+                value = focus_merit_radius(img, self.max_samples)
             else:
                 value = focus_merit(img)
                 if self.metric == "normalized":
@@ -550,7 +822,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Auto-hunt optimal focus of the filtered Sun via full-res shots.")
     parser.add_argument(
-        "--metric", choices=["custom", "normalized", "laplacian"],
+        "--metric", choices=["custom", "normalized", "laplacian", "radius"],
         default="custom",
         help=(
             "Sharpness metric used for focus decisions (default: custom). "
@@ -560,16 +832,51 @@ def main() -> int:
             "(compensates for exposure variation between frames). "
             "'laplacian': Laplacian variance -- standard optical autofocus metric, "
             "well-suited to solar/eclipse images with hard limb edges; "
-            "insensitive to overall brightness changes."
+            "insensitive to overall brightness changes. "
+            "'radius': fits circles to random triplets of strong-gradient limb "
+            "pixels and rewards a smaller fitted disk radius "
+            "(1000 / (avg_radius + 1)); tuned to the solar limb."
         ))
+    parser.add_argument(
+        "--max-samples", type=int, default=DEFAULT_MAX_SAMPLES,
+        help=(
+            "'radius' metric only: max random triplets sampled per frame while "
+            f"collecting {RADIUS_N_VALID} valid ones (default: {DEFAULT_MAX_SAMPLES}). "
+            "The measurement crashes if this budget is exhausted first."
+        ))
+    parser.add_argument(
+        "--auto-expose", action="store_true",
+        help=(
+            "Before hunting, drive the shutter to saturate the disk core "
+            "(required for 'radius' to be focus-sensitive; harmless but "
+            "pointless for the other metrics). Automatically enabled for "
+            "'radius' unless --no-auto-expose is given."
+        ))
+    parser.add_argument(
+        "--no-auto-expose", action="store_true",
+        help="Skip auto-exposure even when --metric radius is selected.")
+    parser.add_argument(
+        "--overexpose-stops", type=float, default=OVEREXPOSE_STOPS,
+        help=(
+            "Auto-exposure: stops past the clipping onset to expose "
+            f"(default: {OVEREXPOSE_STOPS}; ~4x saturation of the disk core)."
+        ))
+    parser.add_argument(
+        "--iso", default=BASE_ISO,
+        help=f"ISO held during auto-exposure (default: {BASE_ISO}).")
     args = parser.parse_args()
 
     cam = FocusCamera()
     cam.metric = args.metric
+    cam.max_samples = args.max_samples
     print(f"[info] sharpness metric: {args.metric}")
+    do_auto_expose = (args.auto_expose
+                      or (args.metric == "radius" and not args.no_auto_expose))
     try:
         cam.open()
         cam.start_liveview()
+        if do_auto_expose:
+            cam.auto_expose_to_clip(args.overexpose_stops, args.iso)
         hunt(cam)
     except KeyboardInterrupt:
         print("\n[abort] interrupted by user")
