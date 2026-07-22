@@ -364,28 +364,38 @@ def _fancy_polar_blur_cartesian(display_np, blur_sigma, mi_crop, mj_crop, moon_r
                 Xf = torch.fft.rfft(row)
                 Gf = torch.fft.rfft(g)
                 polar_h[i] = torch.fft.irfft(Xf * Gf, n=n_theta)
+    del polar  # only polar_h is read from here on
 
     i_lim = int(math.ceil(i_cont))
     i_lim_b = int(min(i_lim, int(n_r)))
     if i_lim_b > 0:
         j_idx = torch.arange(0, int(n_r), device=device, dtype=dtype)
         r_j = radius_max - j_idx * (radius_max - radius_min) / denom_r
-        src_ok = r_j >= float(moon_r)
-        i_rows = torch.arange(0, i_lim_b, device=device, dtype=dtype).view(-1, 1)
+        src_ok_row = (r_j >= float(moon_r)).to(dtype).view(1, -1)
         j_cols = j_idx.view(1, -1)
         sp_t = torch.tensor(sigma_polar, device=device, dtype=dtype)
-        delta = j_cols - i_rows
-        W_vert = torch.exp(-0.5 * (delta / sp_t.clamp(min=1e-20)) ** 2)
-        W_vert = W_vert * src_ok.to(dtype).view(1, -1)
-        row_sum = W_vert.sum(dim=1, keepdim=True)
-        W_vert = W_vert / row_sum.clamp(min=1e-20)
-        bad = (row_sum.squeeze(1) < 1e-20) | (sp_t < 1e-8)
-        if bool(bad.any().item()):
-            bi = torch.nonzero(bad, as_tuple=False).squeeze(-1)
-            W_vert[bi, :] = 0
-            W_vert[bi, bi] = 1.0
         polar_v = polar_h.clone()
-        polar_v[:i_lim_b, :] = W_vert @ polar_h
+        # Chunk over output rows: build only this chunk's [chunk, n_r] weight
+        # slice and matmul it, instead of materializing the full [i_lim_b, n_r]
+        # all-pairs W_vert. Weight values are identical to the unchunked build
+        # (elementwise + per-row reductions); only the matmul's fp32 reduction
+        # order may differ, well below the uint8 output quantization.
+        row_chunk = 4096
+        for s in range(0, i_lim_b, row_chunk):
+            e = min(s + row_chunk, i_lim_b)
+            i_rows = torch.arange(s, e, device=device, dtype=dtype).view(-1, 1)
+            delta = j_cols - i_rows
+            W_chunk = torch.exp(-0.5 * (delta / sp_t.clamp(min=1e-20)) ** 2)
+            W_chunk = W_chunk * src_ok_row
+            row_sum = W_chunk.sum(dim=1, keepdim=True)
+            W_chunk = W_chunk / row_sum.clamp(min=1e-20)
+            bad = (row_sum.squeeze(1) < 1e-20) | (sp_t < 1e-8)
+            if bool(bad.any().item()):
+                bi = torch.nonzero(bad, as_tuple=False).squeeze(-1)
+                W_chunk[bi, :] = 0
+                W_chunk[bi, s + bi] = 1.0  # diagonal: global col == global row
+            polar_v[s:e, :] = W_chunk @ polar_h
+            del W_chunk, delta, row_sum
     else:
         polar_v = polar_h
 
@@ -577,6 +587,7 @@ def warp_merge_to_composite(ctx: Stage3Context) -> None:
     ctx.valid_all = valid_all
     ctx.avg_images.clear()
     ctx.avg_masks.clear()
+    torch.cuda.empty_cache()  # release the per-exposure GPU stack back to the driver
     print(f"Composite shape {ctx.composite.shape}, dtype {ctx.composite.dtype}")
 
 
@@ -743,17 +754,27 @@ def _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n
     # Equivalent to polar_display.quantile(q=q, dim=1).diag() (linear interp, the
     # torch.quantile default), but avoids materializing the [n_r, n_r] all-pairs
     # matrix that .diag() immediately discards.
-    sorted_row, _ = polar_display.sort(dim=1)
-    n_cols = sorted_row.shape[1]
+    #
+    # sort() over the full [n_r, n_theta] tensor also allocates an int64 index
+    # tensor (2x the float32 payload) that we discard, so at full-sensor (raw)
+    # resolution the peak is ~3x polar_display and OOMs. Chunk over rows to bound
+    # the sort's working set; results are identical to a single full sort.
+    n_cols = polar_display.shape[1]
+    n_rows = polar_display.shape[0]
     pos = q * (n_cols - 1)
     lo = pos.floor().long().clamp(max=n_cols - 1)
     up = (lo + 1).clamp(max=n_cols - 1)
     frac = pos - lo.to(pos.dtype)
-    row_idx = torch.arange(sorted_row.shape[0], device=sorted_row.device)
-    v_lo = sorted_row[row_idx, lo]
-    v_up = sorted_row[row_idx, up]
-    p3_row = v_lo + frac * (v_up - v_lo)
-    del sorted_row, v_lo, v_up
+    p3_row = torch.empty(n_rows, device=polar_display.device, dtype=polar_display.dtype)
+    row_chunk = 4096
+    for s in range(0, n_rows, row_chunk):
+        e = min(s + row_chunk, n_rows)
+        sorted_row, _ = polar_display[s:e].sort(dim=1)
+        ri = torch.arange(e - s, device=sorted_row.device)
+        v_lo = sorted_row[ri, lo[s:e]]
+        v_up = sorted_row[ri, up[s:e]]
+        p3_row[s:e] = v_lo + frac[s:e] * (v_up - v_lo)
+        del sorted_row, v_lo, v_up
     p3_smooth = _vertical_gaussian_blur(p3_row.unsqueeze(1), kernel_size=133, sigma=33).squeeze(1)
     p3_polar_2d = p3_smooth.unsqueeze(1).expand(n_r, n_theta)
     p3_at = torch.nan_to_num(
@@ -821,9 +842,11 @@ def fft_unsharp_and_save(ctx: Stage3Context) -> None:
     diff_smooth_r2 = _sliding_diff_smooth_for_sigma(
         display_for_blur, display_for_blur, UNSHARP_GAUSSIAN_SIGMAS[0], inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
     )
+    torch.cuda.empty_cache()
     diff_smooth_r4 = _sliding_diff_smooth_for_sigma(
         display_for_blur, display_for_blur, UNSHARP_GAUSSIAN_SIGMAS[1], inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
     )
+    torch.cuda.empty_cache()
     diff_smooth_r8 = _sliding_diff_smooth_for_sigma(
         display_for_blur, display_for_blur, UNSHARP_GAUSSIAN_SIGMAS[2], inward_median_span, mi_crop, mj_crop, moon_r, dev, a, stride
     )
