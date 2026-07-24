@@ -55,6 +55,10 @@ import numpy as np
 import cv2
 import gphoto2 as gp
 
+# Silence libtiff's benign per-frame chatter (null-padded EXIF ASCII tags and
+# unknown Nikon EXIF tags) emitted by cv2.imdecode on camera TIFFs.
+cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+
 # ---- tunable parameters ---------------------------------------------------
 INITIAL_STEP = 256      # first (coarse) focus step; halved down to 1
 MIN_STEP = 1            # finest step; hunt ends after refining at this size
@@ -400,12 +404,12 @@ class FocusCamera:
                 err, child = gp.gp_widget_get_child_by_name(config, name)
                 assert err == gp.GP_OK, ("get_child", name, err)
                 count = gp.gp_widget_count_choices(child)
-                if isinstance(count, tuple):  # some bindings return (err, n)
+                if isinstance(count, (tuple, list)):  # some bindings return (err, n)
                     count = count[1]
                 out = []
                 for i in range(count):
                     res = gp.gp_widget_get_choice(child, i)
-                    out.append(res[1] if isinstance(res, tuple) else res)
+                    out.append(res[1] if isinstance(res, (tuple, list)) else res)
                 return out
             except Exception as e:
                 print(f"[warn] read choices {name} failed "
@@ -413,6 +417,19 @@ class FocusCamera:
                 if attempt < MAX_RETRY:
                     self.reset()
         raise RuntimeError(f"could not read config choices for {name}")
+
+    def get_config_value(self, name: str):
+        """Read the current value of a config leaf (best-effort, None on error)."""
+        try:
+            err, config = gp.gp_camera_get_config(self.camera, self.context)
+            assert err == gp.GP_OK, ("get_config", err)
+            err, child = gp.gp_widget_get_child_by_name(config, name)
+            assert err == gp.GP_OK, ("get_child", name, err)
+            res = gp.gp_widget_get_value(child)
+            return res[1] if isinstance(res, (tuple, list)) else res
+        except Exception as e:
+            print(f"[warn] read value {name} failed: {e}")
+            return None
 
     def auto_expose_to_clip(self, overexpose_stops: float = OVEREXPOSE_STOPS,
                             iso: str = BASE_ISO) -> str:
@@ -456,6 +473,11 @@ class FocusCamera:
         def clip_frac(idx: int) -> float:
             self.set_config_guarded("shutterspeed", vals[idx])
             time.sleep(SETTLE_S)
+            actual = self.get_config_value("shutterspeed")
+            if actual is not None and str(actual) != str(vals[idx]):
+                print(f"[auto-expose] WARNING: requested shutterspeed "
+                      f"{vals[idx]} but camera reports {actual} -- the write "
+                      f"did not stick (mode not Manual, or liveview override?)")
             img, _, _ = self.capture_image()
             gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                     if img.ndim == 3 else img)
