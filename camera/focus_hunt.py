@@ -49,12 +49,23 @@ camera), e.g.:
 from __future__ import annotations
 
 import argparse
+import base64
 import time
 import sys
 
 import numpy as np
 import cv2
 import gphoto2 as gp
+
+# tkinter is stdlib but can be missing (headless / minimal Python builds) and
+# the actual Tk runtime may lack PNG support (< 8.6). We import it defensively;
+# if anything is off the display simply falls back to saving PNGs (see _show).
+try:
+    import tkinter as tk
+    _TK_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - depends on the host Python build
+    tk = None
+    _TK_IMPORT_ERROR = e
 
 # Silence libtiff's benign per-frame chatter (null-padded EXIF ASCII tags and
 # unknown Nikon EXIF tags) emitted by cv2.imdecode on camera TIFFs. Not present
@@ -113,6 +124,8 @@ BASE_ISO = "100"        # ISO held during auto-exposure (base = least noise)
 
 WINDOW = "Focus Hunt (filtered Sun)"
 PNG_DIR = "focus_hunt"  # only used if there is no display (headless fallback)
+GUI_INIT_W = 800        # tkinter window initial width; frames are downscaled to
+GUI_INIT_H = 600        #  fit the current window size (preserving aspect ratio)
 
 
 def focus_merit(bgr: np.ndarray) -> float:
@@ -329,6 +342,101 @@ def parse_shutter_seconds(s: str) -> float | None:
         return None
 
 
+def _fit_and_annotate(bgr: np.ndarray, lines: list[str],
+                      max_w: int, max_h: int) -> np.ndarray:
+    """Downscale `bgr` to fit (max_w, max_h) keeping aspect, then draw `lines`.
+
+    Only ever shrinks (never upscales). The font size scales with the resized
+    frame height so the overlay stays readable at any window size. Text is drawn
+    green over a thin black outline for legibility on both bright and dark areas.
+    Shared by the tkinter display and the headless PNG fallback.
+    """
+    h, w = bgr.shape[:2]
+    scale = min(max_w / w, max_h / h, 1.0)
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    out = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    fs = max(0.4, nh / 900.0)
+    for i, line in enumerate(lines):
+        y = int(round(24 * fs)) + int(round(26 * fs)) * i
+        cv2.putText(out, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                    (0, 255, 0), 1, cv2.LINE_AA)
+    return out
+
+
+class TkDisplay:
+    """Minimal Tk image window driven from a procedural loop (no mainloop()).
+
+    The focus hunt is a blocking procedural loop, so we cannot hand control to
+    Tk's mainloop() during the run. Instead each show() rebuilds the frame as a
+    PhotoImage and pumps pending Tk events with update(). The frame is encoded
+    to PNG (via cv2) and handed to Tk as base64 -- this needs Tk >= 8.6 (PNG
+    support) but avoids a Pillow dependency.
+
+    The constructor raises RuntimeError if Tk is unavailable or there is no
+    display, so the caller can fall back to headless PNG saving. Closing the
+    window sets `closed` (it is NOT destroyed until destroy()/wait_close()), so
+    a mid-hunt close cleanly flips the caller to the headless path.
+    """
+
+    def __init__(self, title: str, w: int, h: int) -> None:
+        if tk is None:
+            raise RuntimeError(f"tkinter unavailable: {_TK_IMPORT_ERROR}")
+        try:
+            self.root = tk.Tk()
+            self.root.title(title)
+            self.root.geometry(f"{w}x{h}")
+            self.label = tk.Label(self.root, bg="black")
+            self.label.pack(fill="both", expand=True)
+            self.view_w, self.view_h = w, h
+            self.closed = False
+            self._imgref = None  # keep a ref so Tk does not GC the live image
+            self.label.bind("<Configure>", self._on_resize)
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+            self.root.update()
+        except tk.TclError as e:  # typically: no $DISPLAY
+            raise RuntimeError(f"no display for tkinter: {e}") from e
+
+    def _on_resize(self, event) -> None:
+        # track the live widget size so frames scale with the window
+        self.view_w, self.view_h = max(1, event.width), max(1, event.height)
+
+    def _on_close(self) -> None:
+        self.closed = True  # do NOT destroy here; the driver reacts to the flag
+
+    def show(self, bgr: np.ndarray, lines: list[str]) -> None:
+        if self.closed:
+            return
+        out = _fit_and_annotate(bgr, lines, self.view_w, self.view_h)
+        ok, png = cv2.imencode(".png", out)
+        if not ok:
+            return
+        photo = tk.PhotoImage(data=base64.b64encode(png.tobytes()).decode("ascii"))
+        self.label.configure(image=photo)
+        self._imgref = photo  # prevent garbage collection of the shown image
+        try:
+            self.root.update()
+        except tk.TclError:
+            self.closed = True
+
+    def wait_close(self) -> None:
+        """Block (pumping events) until the user closes the window."""
+        while not self.closed:
+            try:
+                self.root.update()
+            except tk.TclError:
+                break
+            time.sleep(0.05)
+        self.destroy()
+
+    def destroy(self) -> None:
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
 class FocusCamera:
     """gphoto2 camera wrapper with self-healing (re-init on error) operations."""
 
@@ -336,12 +444,14 @@ class FocusCamera:
         self.camera = None
         self.context = gp.gp_context_new()
         self.pos = 0                 # software focus position (rel. to infinity)
-        self.headless = False        # set True if no display for cv2 windows
+        self.headless = False        # set True if no display / GUI unavailable
         self.saved_frames = 0        # headless overlay PNGs written
         self.saved_captures = 0      # raw camera files saved to cwd
         self.current_round = 0       # 0 = baseline; increments each step-halving
         self.metric = "custom"       # custom|normalized|laplacian|radius
         self.max_samples = DEFAULT_MAX_SAMPLES  # 'radius' triplet-sample budget
+        self.display = None          # lazily-created TkDisplay (None until first
+                                     #  frame, or if we fell back to headless)
 
     # -- lifecycle ---------------------------------------------------------
     def open(self) -> None:
@@ -371,11 +481,9 @@ class FocusCamera:
         except Exception:
             pass
         self.camera = None
-        if not self.headless:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
+        if self.display is not None:
+            self.display.destroy()
+            self.display = None
 
     # -- config helpers ----------------------------------------------------
     def _set_config(self, name: str, value) -> None:
@@ -746,25 +854,36 @@ class FocusCamera:
         self.saved_captures += 1
 
     def _show(self, bgr: np.ndarray, label: str, sharp: float) -> None:
-        vis = bgr.copy()
-        for i, line in enumerate(
-            [label, f"pos={self.pos}  value={sharp:.3f}"]
-        ):
-            cv2.putText(vis, line, (10, 8 + 7 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.2, (0, 0, 0), 1, cv2.LINE_AA)
-            cv2.putText(vis, line, (10, 8 + 7 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.2, (0, 255, 0), 1, cv2.LINE_AA)
+        lines = [label, f"pos={self.pos}  value={sharp:.3f}"]
         if not self.headless:
-            try:
-                cv2.imshow(WINDOW, vis)
-                cv2.waitKey(1)
-                return
-            except cv2.error as e:
-                print(f"[warn] no display ({e}); falling back to saving PNGs "
-                      f"into {PNG_DIR}/")
-                self.headless = True
-        # headless fallback
+            # Lazily create the Tk window on the first frame.
+            if self.display is None:
+                try:
+                    self.display = TkDisplay(WINDOW, GUI_INIT_W, GUI_INIT_H)
+                except RuntimeError as e:
+                    print(f"[warn] no GUI ({e}); falling back to saving PNGs "
+                          f"into {PNG_DIR}/")
+                    self.headless = True
+            if self.display is not None:
+                if self.display.closed:
+                    # user closed the window mid-hunt -> go headless
+                    print(f"[info] display window closed; saving PNGs into "
+                          f"{PNG_DIR}/ from here on")
+                    self.display.destroy()
+                    self.display = None
+                    self.headless = True
+                else:
+                    try:
+                        self.display.show(bgr, lines)
+                        return
+                    except Exception as e:
+                        print(f"[warn] GUI update failed ({e}); falling back to "
+                              f"saving PNGs into {PNG_DIR}/")
+                        self.headless = True
+                        self.display = None
+        # headless fallback: same downscaled+annotated frame, written to disk
         import os
+        vis = _fit_and_annotate(bgr, lines, GUI_INIT_W, GUI_INIT_H)
         os.makedirs(PNG_DIR, exist_ok=True)
         path = os.path.join(PNG_DIR, f"frame_{self.saved_frames:03d}.png")
         cv2.imwrite(path, vis)
@@ -880,12 +999,10 @@ def hunt(cam: FocusCamera) -> None:
           f"(target {best_pos})")
     print(f"FINAL value          = {final:.3f} (peak seen {best_sharp:.3f})")
     print("=" * 60)
-    if not cam.headless:
-        print("Press any key in the image window to exit...")
-        try:
-            cv2.waitKey(0)
-        except cv2.error:
-            pass
+    if not cam.headless and cam.display is not None:
+        print("Close the image window to exit...")
+        cam.display.wait_close()
+        cam.display = None
 
 
 def main() -> int:
@@ -942,8 +1059,13 @@ def main() -> int:
     print(f"[info] sharpness metric: {args.metric}")
     do_auto_expose = (args.auto_expose
                       or (args.metric == "radius" and not args.no_auto_expose))
+
     try:
         cam.open()
+        # Report (but do not change) the camera's current image quality, so the
+        # log records what capture format the hunt actually ran on.
+        print(f"[info] camera image quality: "
+              f"{cam.get_config_value('imagequality')}")
         cam.start_liveview()
         if do_auto_expose:
             cam.auto_expose_to_clip(args.overexpose_stops, args.iso)
