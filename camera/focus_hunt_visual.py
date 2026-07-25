@@ -61,7 +61,7 @@ import cv2
 # lives in this same directory. Importing it also sets OPENCV_LOG_LEVEL before
 # cv2 loads (silencing libtiff chatter) and pulls in gphoto2.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from focus_hunt import FocusCamera, SETTLE_S  # noqa: E402
+from focus_hunt import FocusCamera, SETTLE_S, set_final_image_quality  # noqa: E402
 
 try:
     import tkinter as tk
@@ -156,15 +156,14 @@ def capture_sequence(abs_pos: int, first_step: int, step: int,
     os.makedirs(OUT_DIR, exist_ok=True)
 
     cam = FocusCamera()
-    orig_quality = None
-    quality_changed = False
+    opened = False
     try:
         cam.open()
-        orig_quality = cam.get_config_value("imagequality")
-        print(f"[info] camera image quality: {orig_quality}")
-        if image_quality and orig_quality != image_quality:
+        opened = True
+        cur = cam.get_config_value("imagequality")
+        print(f"[info] camera image quality: {cur}")
+        if image_quality and cur != image_quality:
             if cam.set_config_guarded("imagequality", image_quality):
-                quality_changed = True
                 print(f"[info] set image quality to '{image_quality}' for "
                       f"full-resolution, decodable frames")
             else:
@@ -204,15 +203,13 @@ def capture_sequence(abs_pos: int, first_step: int, step: int,
         print(f"[info] returned lens to the initial focus position "
               f"(abs {abs_pos:+d}); tracked pos={cam.pos:+d}")
     finally:
-        # Restore the original quality while the camera handle is still alive.
-        if quality_changed and orig_quality:
-            if cam.set_config_guarded("imagequality", orig_quality):
-                print(f"[info] restored image quality to '{orig_quality}'")
-            else:
-                print(f"[warn] could NOT restore image quality -- set it back "
-                      f"to '{orig_quality}' manually in the camera menu")
         cam.stop_liveview()
+        # Leave the camera shooting raw (.NEF) for the eclipse; print last.
+        final_line = set_final_image_quality(cam) if opened else None
         cam.close()
+        if final_line is not None:
+            print()
+            print(final_line)
 
     return images, meta
 

@@ -22,7 +22,7 @@ import sys
 
 # Reuse the self-healing camera wrapper from focus_hunt.py (same directory).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from focus_hunt import FocusCamera  # noqa: E402
+from focus_hunt import FocusCamera, set_final_image_quality  # noqa: E402
 
 
 def main() -> int:
@@ -34,8 +34,10 @@ def main() -> int:
     args = parser.parse_args()
 
     cam = FocusCamera()
+    opened = False
     try:
         cam.open()
+        opened = True
         cam.start_liveview()
         print(f"[info] moving focus by {args.delta:+d} units")
         cam.drive_focus(args.delta)
@@ -45,7 +47,12 @@ def main() -> int:
         print("\n[abort] interrupted by user")
     finally:
         cam.stop_liveview()
+        # Leave the camera shooting raw (.NEF) for the eclipse; print last.
+        final_line = set_final_image_quality(cam) if opened else None
         cam.close()
+        if final_line is not None:
+            print()
+            print(final_line)
     return 0
 
 

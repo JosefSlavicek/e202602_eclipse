@@ -139,8 +139,10 @@ DEFAULT_IMAGE_QUALITY = "JPEG Fine"  # cv2.imdecode needs a JPEG/TIFF frame; a
                         #  NEF/raw only yields a small embedded PREVIEW to
                         #  cv2.imdecode, so the sharpness metrics would run on a
                         #  low-res, camera-processed image. JPEG Fine is full
-                        #  resolution and decodes natively. The camera's original
-                        #  quality is snapshotted at startup and restored on exit.
+                        #  resolution and decodes natively. Every focus-hunt
+                        #  script leaves the camera on FINAL_IMAGE_QUALITY (raw)
+                        #  when it is done -- ready to shoot the eclipse.
+FINAL_IMAGE_QUALITY = "NEF (Raw)"  # camera is left shooting raw once we finish
 
 WINDOW = "Focus Hunt (filtered Sun)"
 PNG_DIR = "focus_hunt"  # only used if there is no display (headless fallback)
@@ -379,6 +381,22 @@ def _gp_error_code(exc: Exception) -> int | None:
         if isinstance(msg, int):
             return msg
     return None
+
+
+def set_final_image_quality(cam: "FocusCamera") -> str:
+    """Leave the camera on FINAL_IMAGE_QUALITY (raw) as the parting state.
+
+    Called by every focus-hunt script once it is done with the camera (handle
+    still alive). Prints a warning immediately on failure -- in case any later
+    output fails too -- and returns the status line so the caller can print it
+    LAST for visibility.
+    """
+    if cam.set_config_guarded("imagequality", FINAL_IMAGE_QUALITY):
+        return f"Image quality set to {FINAL_IMAGE_QUALITY}"
+    line = (f"WARNING: could NOT set image quality to '{FINAL_IMAGE_QUALITY}' "
+            f"-- set it manually in the camera menu")
+    print(line)
+    return line
 
 
 def _fit_and_annotate(bgr: np.ndarray, lines: list[str],
@@ -1163,23 +1181,19 @@ def main() -> int:
     do_auto_expose = (args.auto_expose
                       or (args.metric == "radius" and not args.no_auto_expose))
 
-    orig_quality = None    # camera's image quality as found at startup
-    quality_changed = False  # True once we have written a different quality
+    opened = False         # True once cam.open() succeeded (handle is usable)
 
     try:
         cam.open()
-        # Snapshot the camera's current image quality, then switch to the
-        # requested capture format for the hunt. Skipped if --image-quality is
-        # empty (leave the camera as-is) or already matches.
+        opened = True
+        # Switch to the requested capture format for the hunt (JPEG Fine by
+        # default so the metrics run on a full-res, decodable frame). Skipped if
+        # --image-quality is empty (leave the camera as-is) or already matches.
         if args.image_quality:
-            orig_quality = cam.get_config_value("imagequality")
-            print(f"[info] image quality currently '{orig_quality}'")
-            if orig_quality is None:
-                print("[warn] could not read the current image quality; will "
-                      "still switch for the hunt but CANNOT auto-restore it")
-            if orig_quality != args.image_quality:
+            cur = cam.get_config_value("imagequality")
+            print(f"[info] image quality currently '{cur}'")
+            if cur != args.image_quality:
                 if cam.set_config_guarded("imagequality", args.image_quality):
-                    quality_changed = True
                     print(f"[info] image quality set to "
                           f"'{args.image_quality}' for the hunt")
                 else:
@@ -1196,30 +1210,14 @@ def main() -> int:
         print("\n[abort] interrupted by user")
     finally:
         cam.stop_liveview()
-        # Restore the original image quality while the camera handle is still
-        # alive. We build the single final status line here, then close the
-        # camera, then print that line LAST so it is unmistakably the last thing
-        # the script emits (blank line above it for visibility).
-        restore_line = None
-        if quality_changed:
-            if orig_quality is None:
-                # We switched formats but never learned the original value.
-                restore_line = (
-                    f"WARNING: image quality was NOT restored -- original value "
-                    f"was unknown; it is now '{args.image_quality}', set the "
-                    f"quality you want manually in the camera menu")
-                print(restore_line)  # now too, in case anything below fails
-            elif cam.set_config_guarded("imagequality", orig_quality):
-                restore_line = f"Image quality restored to {orig_quality}"
-            else:
-                restore_line = (
-                    f"WARNING: image quality was NOT restored -- set it back to "
-                    f"'{orig_quality}' manually in the camera menu")
-                print(restore_line)  # now too, in case anything below fails
+        # Leave the camera shooting raw (.NEF) for the eclipse. Done while the
+        # handle is still alive; the status line is printed LAST (blank line
+        # above it) so it is unmistakably the final thing the script emits.
+        final_line = set_final_image_quality(cam) if opened else None
         cam.close()
-        if restore_line is not None:
+        if final_line is not None:
             print()  # one empty line so the final status stands out
-            print(restore_line)
+            print(final_line)
     return 0
 
 
