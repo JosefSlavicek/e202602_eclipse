@@ -57,8 +57,12 @@ import cv2
 import gphoto2 as gp
 
 # Silence libtiff's benign per-frame chatter (null-padded EXIF ASCII tags and
-# unknown Nikon EXIF tags) emitted by cv2.imdecode on camera TIFFs.
-cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+# unknown Nikon EXIF tags) emitted by cv2.imdecode on camera TIFFs. Not present
+# on older OpenCV builds, so guard it -- it is a nicety, not a requirement.
+try:
+    cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+except AttributeError:
+    pass
 
 # ---- tunable parameters ---------------------------------------------------
 INITIAL_STEP = 256      # first (coarse) focus step; halved down to 1
@@ -716,6 +720,9 @@ class FocusCamera:
             last = img
             self._save_capture(raw, name, value)
         sharp = float(np.mean(scores))
+        # Always report the ACTUAL current focus position (cam.pos), not just
+        # the intended target -- the two diverge if a drive chunk is dropped.
+        print(f"[measure] pos={self.pos:+d} value={sharp:.3f} ({label})")
         self._show(last, label, sharp)
         # Give the camera time to fully resume live view after the shutter
         # fired; without this pause the next manualfocusdrive arrives while
@@ -743,10 +750,10 @@ class FocusCamera:
         for i, line in enumerate(
             [label, f"pos={self.pos}  value={sharp:.3f}"]
         ):
-            cv2.putText(vis, line, (10, 30 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(vis, line, (10, 30 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(vis, line, (10, 8 + 7 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.2, (0, 0, 0), 1, cv2.LINE_AA)
+            cv2.putText(vis, line, (10, 8 + 7 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.2, (0, 255, 0), 1, cv2.LINE_AA)
         if not self.headless:
             try:
                 cv2.imshow(WINDOW, vis)
@@ -869,7 +876,8 @@ def hunt(cam: FocusCamera) -> None:
     cam.move_to(best_pos, reversing=True, strict=True)
     final = cam.measure(f"FINAL pos={best_pos}")
     print("=" * 60)
-    print(f"FINAL focus position = {best_pos} steps from infinity")
+    print(f"FINAL focus position = {cam.pos} steps from infinity "
+          f"(target {best_pos})")
     print(f"FINAL value          = {final:.3f} (peak seen {best_sharp:.3f})")
     print("=" * 60)
     if not cam.headless:
