@@ -17,12 +17,14 @@ a higher value has a sharper, more consistently strong border and is preferred.
 
 Assumptions / procedure
 ------------------------
-* The lens starts at INFINITY. We therefore probe in the NEGATIVE focus
-  direction first (the same sign the original PoC used: manualfocusdrive -N).
+* The lens starts already ROUGHLY FOCUSED (not at a hard stop), so the true
+  peak is expected to be close on either side. We therefore begin with a
+  modest step and probe both directions; the first probe just uses a nominal
+  direction (negative) as a tie-break.
 * Nikon `manualfocusdrive` is a RANGE *action*: each set drives the focus motor
   RELATIVELY by the given (signed) amount. There is no way to read back an
   absolute focus position, so we track our own software position counter `pos`
-  (units = focus-drive steps relative to the infinity start).
+  (units = focus-drive steps relative to the starting position).
 * Search = neighbour-probe hill-climb with step halving. Starting from a large
   step we keep stepping in the improving direction; when neither neighbour
   improves we halve the step and try again, down to MIN_STEP, then return to
@@ -50,8 +52,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import os
 import time
 import sys
+
+# Silence OpenCV's libtiff WARN chatter (null-padded EXIF ASCII tags, unknown
+# Nikon EXIF tags) that floods the log when decoding camera TIFFs. This env var
+# is read by OpenCV at import, so it MUST be set before `import cv2`; it is the
+# reliable path on builds whose cv2 lacks setLogLevel (see the guarded call
+# below, kept as belt-and-suspenders).
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 import numpy as np
 import cv2
@@ -76,7 +86,9 @@ except AttributeError:
     pass
 
 # ---- tunable parameters ---------------------------------------------------
-INITIAL_STEP = 256      # first (coarse) focus step; halved down to 1
+INITIAL_STEP = 32       # first (coarse) focus step; halved down to MIN_STEP.
+                        #  Modest because the lens starts already roughly
+                        #  focused, so the peak is expected nearby
 MIN_STEP = 4            # finest step; hunt ends after refining at this size
                         #  (not smaller than 4: the focus motor starts to fail
                         #   / no-op on sub-4-unit moves)
@@ -111,7 +123,7 @@ RADIUS_COS_MIN = 0.5    # min cosine between (point->circumcentre) and the
 RADIUS_N_VALID = 1024   # valid triplets collected before scoring
 RADIUS_TOP_SCORE = 128  # highest-score valids whose radii are averaged
 RADIUS_SAMPLE_BATCH = 4096   # triplets evaluated per vectorised batch
-DEFAULT_MAX_SAMPLES = 128 * 1024  # crash if this many samples fail to yield
+DEFAULT_MAX_SAMPLES = 512 * 1024  # crash if this many samples fail to yield
                         #  RADIUS_N_VALID valid triplets (cmdline overridable)
 COLLINEAR_EPS = 1e-6    # |2*signed-area| below this => collinear, reject early
 
@@ -121,6 +133,14 @@ CLIP_ONSET_FRAC = 5e-4  # frame fraction saturated that marks "clipping began"
 OVEREXPOSE_STOPS = 2.0  # default stops PAST onset to expose (~4x; the ~over=4
                         #  regime that made the radius metric focus-sensitive)
 BASE_ISO = "100"        # ISO held during auto-exposure (base = least noise)
+
+# ---- capture format -------------------------------------------------------
+DEFAULT_IMAGE_QUALITY = "JPEG Fine"  # cv2.imdecode needs a JPEG/TIFF frame; a
+                        #  NEF/raw only yields a small embedded PREVIEW to
+                        #  cv2.imdecode, so the sharpness metrics would run on a
+                        #  low-res, camera-processed image. JPEG Fine is full
+                        #  resolution and decodes natively. The camera's original
+                        #  quality is snapshotted at startup and restored on exit.
 
 WINDOW = "Focus Hunt (filtered Sun)"
 PNG_DIR = "focus_hunt"  # only used if there is no display (headless fallback)
@@ -342,6 +362,25 @@ def parse_shutter_seconds(s: str) -> float | None:
         return None
 
 
+def _gp_error_code(exc: Exception) -> int | None:
+    """Extract the gphoto2 numeric error code from a raised _set_config error.
+
+    _set_config asserts with a message tuple whose LAST element is the gphoto2
+    error code, e.g. ``assert err == GP_OK, ("set_config", name, err)`` -> the
+    raised AssertionError has ``args == (("set_config", name, err),)``. So the
+    code lives at ``args[0][-1]`` (not ``args[-1]`` -- that is the whole tuple,
+    a subtle trap that silently defeated the old -110 busy check). Some asserts
+    pass a bare int message; handle that too. Returns None if no int is found.
+    """
+    if isinstance(exc, AssertionError) and exc.args:
+        msg = exc.args[0]
+        if isinstance(msg, (tuple, list)) and msg and isinstance(msg[-1], int):
+            return msg[-1]
+        if isinstance(msg, int):
+            return msg
+    return None
+
+
 def _fit_and_annotate(bgr: np.ndarray, lines: list[str],
                       max_w: int, max_h: int) -> np.ndarray:
     """Downscale `bgr` to fit (max_w, max_h) keeping aspect, then draw `lines`.
@@ -443,7 +482,7 @@ class FocusCamera:
     def __init__(self) -> None:
         self.camera = None
         self.context = gp.gp_context_new()
-        self.pos = 0                 # software focus position (rel. to infinity)
+        self.pos = 0                 # software focus position (rel. to start)
         self.headless = False        # set True if no display / GUI unavailable
         self.saved_frames = 0        # headless overlay PNGs written
         self.saved_captures = 0      # raw camera files saved to cwd
@@ -452,6 +491,9 @@ class FocusCamera:
         self.max_samples = DEFAULT_MAX_SAMPLES  # 'radius' triplet-sample budget
         self.display = None          # lazily-created TkDisplay (None until first
                                      #  frame, or if we fell back to headless)
+        self.liveview = False        # True while live view is (meant to be) on;
+                                     #  reset() re-arms it so focus drive keeps
+                                     #  working after a re-init
 
     # -- lifecycle ---------------------------------------------------------
     def open(self) -> None:
@@ -473,6 +515,25 @@ class FocusCamera:
         self.camera = None
         time.sleep(1.0)
         self._init_handle()
+        # Re-arm live view if the hunt was running in it. Nikon manualfocusdrive
+        # ONLY works in live view, so without this every focus drive after a
+        # reset fails -- turning one camera hiccup into an endless -113 cascade.
+        if self.liveview:
+            self._arm_liveview_quiet()
+
+    def _arm_liveview_quiet(self) -> None:
+        """Enable live view best-effort WITHOUT triggering a reset.
+
+        Used from reset() (and start_liveview); it calls _set_config directly
+        rather than set_config_guarded so a failure cannot recurse back into
+        reset() -> _arm_liveview_quiet -> reset() ...
+        """
+        for name, val in (("controlmode", "0"), ("viewfinder", 1)):
+            try:
+                self._set_config(name, val)
+            except Exception as e:
+                print(f"[warn] re-arm live view: set {name}={val} failed: {e}")
+        time.sleep(0.8)
 
     def close(self) -> None:
         try:
@@ -688,8 +749,14 @@ class FocusCamera:
         self.set_config_guarded("controlmode", "0")
         self.set_config_guarded("viewfinder", 1)
         time.sleep(0.8)
+        # Set the flag LAST: only now should a later reset() try to re-arm live
+        # view (setting it earlier could recurse through the guarded sets above).
+        self.liveview = True
 
     def stop_liveview(self) -> None:
+        # Clear the flag FIRST so the guarded set below (or any reset it spawns)
+        # does not try to re-arm the live view we are intentionally turning off.
+        self.liveview = False
         self.set_config_guarded("viewfinder", 0)
 
     # -- image capture -----------------------------------------------------
@@ -745,11 +812,20 @@ class FocusCamera:
     def drive_focus(self, delta: int, strict: bool = False) -> None:
         """Move focus RELATIVELY by `delta` units, split into safe chunks.
 
-        In normal mode (strict=False) a failed chunk is NOT retried (the motor
-        may have moved a partial, unknown amount): we reset the camera, assume
-        the chunk did not move, drop it from the tracked position, and continue.
-        The closed-loop hunt corrects any resulting small offset on the next
-        measurement.
+        In normal mode (strict=False) a failed chunk is NOT retried blindly (the
+        motor may have moved a partial, unknown amount). How we react depends on
+        the camera's error code, and in every failure case we ABANDON the rest
+        of this move rather than hammering the remaining chunks -- the closed-
+        loop hunt corrects the resulting small offset on the next measurement:
+
+          * -110 GP_ERROR_CAMERA_BUSY -- fully rejected, motor provably did not
+            move; wait 1 s and retry the chunk ONCE, then give up the move.
+          * -113 GP_ERROR_CAMERA_ERROR -- the camera refused the drive, almost
+            always because the lens is at the end of its focus travel (or is not
+            in a drivable state). The handle is fine, so we do NOT reset (a reset
+            would drop live view and make every later drive fail); we just stop
+            this move.
+          * anything else -- possibly a broken handle; reset once, then stop.
 
         In strict mode (strict=True) any failure raises RuntimeError so the
         caller knows the final position was not reached.
@@ -763,35 +839,49 @@ class FocusCamera:
             try:
                 self._set_config("manualfocusdrive", move)
                 self.pos += move
+                remaining -= abs(move)
+                time.sleep(MOVE_PAUSE)
+                continue
             except Exception as e:
-                # -110 = GP_ERROR_CAMERA_BUSY: the command was fully rejected,
-                # the motor provably did not move, so retrying is safe.
-                is_busy = (isinstance(e, AssertionError) and e.args
-                           and e.args[-1] == -110)
-                if is_busy:
-                    print(f"[warn] focus drive {move} busy (-110); "
-                          f"waiting 1 s and retrying")
-                    time.sleep(1.0)
-                    try:
-                        self._set_config("manualfocusdrive", move)
-                        self.pos += move
-                    except Exception as e2:
-                        if strict:
-                            raise RuntimeError(
-                                f"final focus move chunk {move} failed after "
-                                f"busy-retry: {e2}") from e2
-                        print(f"[warn] focus drive {move} retry failed: {e2} "
-                              f"(assuming no move; resetting)")
-                        self.reset()
-                else:
+                # Stash the exception: Python clears `e` when the except block
+                # exits, so the branches below must use `err`, not `e`.
+                err = e
+                code = _gp_error_code(e)
+
+            if code == -110:  # busy: motor did not move -> safe to retry once
+                print(f"[warn] focus drive {move} busy (-110); "
+                      f"waiting 1 s and retrying once")
+                time.sleep(1.0)
+                try:
+                    self._set_config("manualfocusdrive", move)
+                    self.pos += move
+                    remaining -= abs(move)
+                    time.sleep(MOVE_PAUSE)
+                    continue
+                except Exception as e2:
                     if strict:
                         raise RuntimeError(
-                            f"final focus move chunk {move} failed: {e}") from e
-                    print(f"[warn] focus drive {move} failed: {e} "
-                          f"(assuming no move; resetting)")
-                    self.reset()
-            remaining -= abs(move)
-            time.sleep(MOVE_PAUSE)
+                            f"final focus move chunk {move} failed after "
+                            f"busy-retry: {e2}") from e2
+                    print(f"[warn] focus drive {move} still busy; "
+                          f"abandoning this move (closed loop will re-measure)")
+                    return
+            elif code == -113:  # camera refused: end of travel / not drivable
+                if strict:
+                    raise RuntimeError(
+                        f"final focus move chunk {move} refused (-113): "
+                        f"{err}") from err
+                print(f"[warn] focus drive {move} refused by camera (-113) -- "
+                      f"likely end of focus travel; abandoning this move")
+                return
+            else:  # unknown: the handle may be bad -> reset once, then stop
+                if strict:
+                    raise RuntimeError(
+                        f"final focus move chunk {move} failed: {err}") from err
+                print(f"[warn] focus drive {move} failed: {err} "
+                      f"(assuming no move; resetting, then abandoning this move)")
+                self.reset()
+                return
 
     def move_to(self, target_pos: int, reversing: bool = False,
                 strict: bool = False) -> None:
@@ -893,14 +983,14 @@ class FocusCamera:
 def hunt(cam: FocusCamera) -> None:
     moves_used = 0
 
-    # Baseline at the starting (infinity) position.
+    # Baseline at the starting (roughly-focused) position.
     best_pos = 0
     cam.current_round = 0
-    best_sharp = cam.measure("start (infinity)")
+    best_sharp = cam.measure("start (roughly focused)")
     print(f"[baseline] pos={best_pos} value={best_sharp:.3f}")
 
     step = INITIAL_STEP
-    pref = -1  # probe the NEGATIVE direction first (away from infinity)
+    pref = -1  # nominal first-probe direction (tie-break); both sides are probed
     round_num = 1
 
     while step >= MIN_STEP:
@@ -995,7 +1085,7 @@ def hunt(cam: FocusCamera) -> None:
     cam.move_to(best_pos, reversing=True, strict=True)
     final = cam.measure(f"FINAL pos={best_pos}")
     print("=" * 60)
-    print(f"FINAL focus position = {cam.pos} steps from infinity "
+    print(f"FINAL focus position = {cam.pos} steps from start "
           f"(target {best_pos})")
     print(f"FINAL value          = {final:.3f} (peak seen {best_sharp:.3f})")
     print("=" * 60)
@@ -1051,6 +1141,19 @@ def main() -> int:
     parser.add_argument(
         "--iso", default=BASE_ISO,
         help=f"ISO held during auto-exposure (default: {BASE_ISO}).")
+    parser.add_argument(
+        "--image-quality", default=DEFAULT_IMAGE_QUALITY,
+        help=(
+            "Camera image-quality setting used DURING the hunt "
+            f"(default: '{DEFAULT_IMAGE_QUALITY}'). Frames are decoded with "
+            "cv2.imdecode, which needs a JPEG/TIFF frame -- a RAW/.NEF only "
+            "decodes as a small embedded preview, so the metrics would run on a "
+            "low-res image. JPEG Fine keeps full resolution and decodes "
+            "natively. The camera's current quality is read at startup and "
+            "restored on exit. Pass the exact camera label (e.g. 'JPEG Fine', "
+            "'JPEG Normal', 'TIFF', 'NEF (Raw)'); use the empty string to leave "
+            "the camera's quality untouched."
+        ))
     args = parser.parse_args()
 
     cam = FocusCamera()
@@ -1060,12 +1163,31 @@ def main() -> int:
     do_auto_expose = (args.auto_expose
                       or (args.metric == "radius" and not args.no_auto_expose))
 
+    orig_quality = None    # camera's image quality as found at startup
+    quality_changed = False  # True once we have written a different quality
+
     try:
         cam.open()
-        # Report (but do not change) the camera's current image quality, so the
-        # log records what capture format the hunt actually ran on.
-        print(f"[info] camera image quality: "
-              f"{cam.get_config_value('imagequality')}")
+        # Snapshot the camera's current image quality, then switch to the
+        # requested capture format for the hunt. Skipped if --image-quality is
+        # empty (leave the camera as-is) or already matches.
+        if args.image_quality:
+            orig_quality = cam.get_config_value("imagequality")
+            print(f"[info] image quality currently '{orig_quality}'")
+            if orig_quality is None:
+                print("[warn] could not read the current image quality; will "
+                      "still switch for the hunt but CANNOT auto-restore it")
+            if orig_quality != args.image_quality:
+                if cam.set_config_guarded("imagequality", args.image_quality):
+                    quality_changed = True
+                    print(f"[info] image quality set to "
+                          f"'{args.image_quality}' for the hunt")
+                else:
+                    print(f"[warn] could not set image quality to "
+                          f"'{args.image_quality}'; continuing as-is")
+            else:
+                print(f"[info] image quality already '{args.image_quality}'; "
+                      f"leaving it")
         cam.start_liveview()
         if do_auto_expose:
             cam.auto_expose_to_clip(args.overexpose_stops, args.iso)
@@ -1074,7 +1196,30 @@ def main() -> int:
         print("\n[abort] interrupted by user")
     finally:
         cam.stop_liveview()
+        # Restore the original image quality while the camera handle is still
+        # alive. We build the single final status line here, then close the
+        # camera, then print that line LAST so it is unmistakably the last thing
+        # the script emits (blank line above it for visibility).
+        restore_line = None
+        if quality_changed:
+            if orig_quality is None:
+                # We switched formats but never learned the original value.
+                restore_line = (
+                    f"WARNING: image quality was NOT restored -- original value "
+                    f"was unknown; it is now '{args.image_quality}', set the "
+                    f"quality you want manually in the camera menu")
+                print(restore_line)  # now too, in case anything below fails
+            elif cam.set_config_guarded("imagequality", orig_quality):
+                restore_line = f"Image quality restored to {orig_quality}"
+            else:
+                restore_line = (
+                    f"WARNING: image quality was NOT restored -- set it back to "
+                    f"'{orig_quality}' manually in the camera menu")
+                print(restore_line)  # now too, in case anything below fails
         cam.close()
+        if restore_line is not None:
+            print()  # one empty line so the final status stands out
+            print(restore_line)
     return 0
 
 
