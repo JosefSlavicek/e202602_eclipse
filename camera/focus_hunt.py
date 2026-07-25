@@ -25,9 +25,10 @@ Assumptions / procedure
   (units = focus-drive steps relative to the infinity start).
 * Search = neighbour-probe hill-climb with step halving. Starting from a large
   step we keep stepping in the improving direction; when neither neighbour
-  improves we halve the step and try again, down to step size 1, then return to
-  the best position found. This reproduces the "hunt, halve, settle at step 1"
-  behaviour and is self-correcting: because every decision is made on a freshly
+  improves we halve the step and try again, down to MIN_STEP, then return to
+  the best position found. This reproduces the "hunt, halve, settle at the
+  finest step" behaviour and is self-correcting: because every decision is made
+  on a freshly
   MEASURED sharpness, small position-tracking errors (e.g. a dropped move after
   a USB hiccup) do not accumulate into wrong decisions.
 
@@ -61,7 +62,9 @@ cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
 
 # ---- tunable parameters ---------------------------------------------------
 INITIAL_STEP = 256      # first (coarse) focus step; halved down to 1
-MIN_STEP = 1            # finest step; hunt ends after refining at this size
+MIN_STEP = 4            # finest step; hunt ends after refining at this size
+                        #  (not smaller than 4: the focus motor starts to fail
+                        #   / no-op on sub-4-unit moves)
 DRIVE_CHUNK = 100       # max focus units per single manualfocusdrive command
                         # (kept at the PoC's known-good magnitude; large moves
                         #  are split into several chunked commands)
@@ -440,9 +443,12 @@ class FocusCamera:
         We therefore hold the camera at base ISO and a fixed aperture and drive
         the SHUTTER to a deliberate overexposure:
 
-          1. Scan the available shutter speeds from fastest toward slowest and
-             stop at the first one where at least CLIP_ONSET_FRAC of the frame
-             is saturated -- the clipping "onset".
+          1. Find the clipping "onset" -- the fastest shutter speed at which at
+             least CLIP_ONSET_FRAC of the frame is saturated. Saturation grows
+             monotonically with exposure time, so instead of probing every
+             speed we bracket the onset: starting fast we double the exposure
+             time each probe until it overshoots, then bisect that last bracket
+             (stepping back down) to pin the exact onset in ~log2 shots.
           2. Multiply that exposure by 2**overexpose_stops (default 2 stops =>
              ~4x, the regime we validated) and set the nearest available speed.
 
@@ -483,21 +489,55 @@ class FocusCamera:
                     if img.ndim == 3 else img)
             return float((gray >= CLIP_VALUE).mean())
 
-        # Scan up from the fastest speed; stop at clipping onset. Starting fast
-        # keeps every probe exposure short and avoids firing a multi-second one.
-        onset = None
-        for i in range(len(vals)):
+        # Find the clipping onset. clip_frac() is monotonic in exposure time
+        # (more time => more saturation), so we don't need to probe every speed:
+        #   Phase 1 (coarse, doubling up): start at the fastest speed and, while
+        #   still too short, jump to the first speed with at least ~2x the
+        #   exposure time. This races up in ~log2 probes instead of one-at-a-time.
+        #   Phase 2 (fine, stepping down): once a probe reaches the onset we have
+        #   overshot; bisect the last (too-short, clips] bracket -- smaller and
+        #   smaller steps -- to pin the FASTEST speed that still clips.
+        def probe(i: int) -> float:
             frac = clip_frac(i)
             print(f"[auto-expose] probe {vals[i]}s "
-                  f"({secs[i] * 1000:.3f} ms): clipped {frac * 100:.3f}%")
-            if frac >= CLIP_ONSET_FRAC:
+                  f"({secs[i] * 1000:.3f} ms): clipped {frac * 100:.3f}% "
+                  f"{'(onset)' if frac >= CLIP_ONSET_FRAC else '(too short)'}")
+            return frac
+
+        onset = None
+        lo = -1  # fastest index verified BELOW onset (too short); -1 => none yet
+        i = 0
+        while i < len(vals):
+            if probe(i) >= CLIP_ONSET_FRAC:
                 onset = i
                 break
+            lo = i
+            # jump to the first speed with >= 2x this exposure time, but never
+            # skip past the slowest speed (so we always test it before giving up)
+            target2 = secs[i] * 2.0
+            nxt = i + 1
+            while nxt < len(vals) - 1 and secs[nxt] < target2:
+                nxt += 1
+            i = max(nxt, i + 1)
+
         if onset is None:
             raise RuntimeError(
                 f"auto-expose: even {vals[-1]}s does not reach the clipping "
                 f"onset ({CLIP_ONSET_FRAC * 100:.3f}% of frame). Open the "
                 f"aperture or raise ISO -- the disk is too dim to saturate.")
+
+        # Phase 2: bisect (lo, onset] for the smallest exposure that still clips.
+        # The doubling in phase 1 may have leapt over the true onset; this walks
+        # back down with halving steps to the exact boundary the linear scan
+        # would have found -- but in ~log2 probes instead of one per speed.
+        hi = onset
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if probe(mid) >= CLIP_ONSET_FRAC:
+                hi = mid
+            else:
+                lo = mid
+        onset = hi
 
         target = secs[onset] * (2.0 ** overexpose_stops)
         pick = min(range(len(secs)), key=lambda i: abs(secs[i] - target))
