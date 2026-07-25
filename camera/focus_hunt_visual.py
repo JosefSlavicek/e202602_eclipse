@@ -237,9 +237,9 @@ class Viewer:
         self._photo = None  # keep a ref so Tk does not GC the shown image
 
         self._build_ui()
-        # Fit once the window has a real size.
+        # Start at 1:1 zoom centred on the image (cx, cy are already the centre).
         self.root.update_idletasks()
-        self.fit()
+        self.one_to_one()
 
     # -- UI ----------------------------------------------------------------
     def _build_ui(self) -> None:
