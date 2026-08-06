@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import argparse
+import json
 
 import torch
 from eclipse_v2.device import configure_cuda_visible_devices, require_cuda
@@ -39,14 +40,22 @@ from eclipse_v2.stage3 import (
 
 def _parse_args():
     ap = argparse.ArgumentParser(description="Eclipse v2 pipeline")
-    ap.add_argument("--input-mode", choices=["jpg", "nef", "inject"],
+    ap.add_argument("--input-mode", choices=["jpg", "atmosphere", "nef", "inject"],
                     default=os.environ.get("ECLIPSE_V2_INPUT_MODE", "jpg"))
     ap.add_argument("--jpg-dir", type=Path,
                     default=Path(os.environ.get("EDA00_DATA_ROOT", "/home/slavik/e202602_eclipse/data")))
+    ap.add_argument("--atmosphere-dir", type=Path,
+                    default=Path(os.environ.get("ECLIPSE_V2_ATMOSPHERE_DIR",
+                                                "/home/slavik/e202602_eclipse/data_atmosphere")),
+                    help="For --input-mode atmosphere: the data_atmosphere/ directory "
+                         "built by make_data_atmosphere.py (must contain atmosphere.json).")
     ap.add_argument("--nef-dir", type=Path,
                     default=Path(os.environ.get("ECLIPSE_V2_NEF_DIR", "/home/slavik/tmp/eclipse_fake_imgs")))
-    ap.add_argument("--workdir", type=Path,
-                    default=Path(os.environ.get("ECLIPSE_V2_WORKDIR", "/home/slavik/tmp/eclipse_v2_run")))
+    ap.add_argument("--workdir", type=Path, default=None,
+                    help="Default /home/slavik/tmp/eclipse_v2_run, or $ECLIPSE_V2_WORKDIR. "
+                         "In --input-mode atmosphere the default gains an _atmosphere "
+                         "suffix so a comparison run cannot clobber the baseline; pass "
+                         "--workdir or set the env var to override.")
     ap.add_argument("--exposure-group-subsample", type=int,
                     default=int(os.environ.get("ECLIPSE_V2_EXPOSURE_GROUP_SUBSAMPLE", "1")),
                     help="Keep ~1/N of the exposure groups (1=all, 2=~half, 3=~third, ...); "
@@ -60,13 +69,28 @@ if __name__ == "__main__":
     require_cuda()
 
     args = _parse_args()
-    WORKDIR = args.workdir
+    if args.workdir is not None:
+        WORKDIR = args.workdir
+    elif "ECLIPSE_V2_WORKDIR" in os.environ:
+        WORKDIR = Path(os.environ["ECLIPSE_V2_WORKDIR"])
+    else:
+        WORKDIR = Path("/home/slavik/tmp/eclipse_v2_run"
+                       + ("_atmosphere" if args.input_mode == "atmosphere" else ""))
     WORKDIR.mkdir(parents=True, exist_ok=True)
 
     source = make_source(
-        args.input_mode, jpg_dir=args.jpg_dir, nef_dir=args.nef_dir
+        args.input_mode, jpg_dir=args.jpg_dir, nef_dir=args.nef_dir,
+        atmosphere_dir=args.atmosphere_dir,
     )
     print(f"Input mode: {source.kind} (is_linear={source.is_linear})")
+    print(f"Workdir:    {WORKDIR}")
+    if source.kind == "atmosphere":
+        # Log and archive what this run consumed: the frames look like mode-1 JPGs,
+        # so without this the outputs would be indistinguishable from a baseline run.
+        print(f"Atmosphere: {source.data_root}")
+        print(source.describe())
+        with open(WORKDIR / "v2-input-atmosphere.json", "w") as fh:
+            json.dump(source.meta, fh, indent=2)
 
     PK_STAGE0 = WORKDIR / "v2-stage0.pkl"
     PK_STAGE1 = WORKDIR / "v2-stage1.pkl"

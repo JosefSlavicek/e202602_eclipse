@@ -1,13 +1,18 @@
-"""Input sources for the v2 pipeline: JPG, real NEF, and NEF+injected-corona.
+"""Input sources for the v2 pipeline: JPG, atmosphere-distorted JPG, real NEF, and
+NEF+injected-corona.
 
 The whole pipeline consumes a single 2-D [0,1] luminance per frame (color is fabricated
 only at the very end in stage3). So an input mode is fully described by:
   - how to enumerate frames and read their (exposure, timestamp, size, brightness);
   - how to load one frame as a float32 [0,1] grayscale tensor.
 
-Three modes:
-  jpg     - folder of JPGs, identical to v1 behavior (gamma-encoded values).
-  nef     - folder of .NEF, decoded as real *linear* raw luminance.
+Four modes:
+  jpg        - folder of JPGs, identical to v1 behavior (gamma-encoded values).
+  atmosphere - the same JPG set re-rendered as it would look with the Sun 8 deg up
+               (data_atmosphere/, built by make_data_atmosphere.py). Byte-identical
+               format to `jpg`, so it is a drop-in for measuring how much the
+               pipeline degrades under the 2026 target atmosphere.
+  nef        - folder of .NEF, decoded as real *linear* raw luminance.
   inject  - folder of .NEF (counts/exposures/timestamps/noise from the real NEFs) with
             corona content faked per frame from the nearest-log v1 JPG exposure group,
             placed on the real NEF noise floor (see NefInjectSource for the rationale).
@@ -18,6 +23,7 @@ active source via `ImageInfo.source`, which is re-attached after every pickle lo
 """
 from __future__ import annotations
 
+import json
 import math
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -115,6 +121,64 @@ class JpgSource(FrameSource):
             arr = np.array(img).astype(np.float32) / 255.0
         assert arr.ndim == 3 and arr.shape[-1] == 3, (ii.path, arr.shape)
         return torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------- #
+#  Atmosphere-distorted JPG  (mode 1b)                                        #
+# --------------------------------------------------------------------------- #
+class AtmosphereSource(JpgSource):
+    """`data_atmosphere/` — the JPG set re-rendered with the Sun 8 deg above the horizon.
+
+    Same format as `jpg`: 6000x4000 sRGB JPEGs, original filenames, EXIF copied
+    verbatim (so exposures and sub-second timestamps still parse). The pipeline
+    therefore treats these frames exactly like mode 1, which is the point — the only
+    difference between a `jpg` run and an `atmosphere` run is the atmosphere.
+
+    The extra behaviour here is provenance: the directory carries an atmosphere.json
+    listing every distortion applied and its size, which is loaded so a run can log
+    and archive what it consumed.
+    """
+
+    kind = "atmosphere"
+
+    def __init__(self, data_root):
+        super().__init__(data_root)
+        meta_path = self.data_root / "atmosphere.json"
+        assert meta_path.is_file(), (
+            f"{self.data_root} has no atmosphere.json — mode 'atmosphere' expects the "
+            f"output of make_data_atmosphere.py, not a plain folder of JPGs")
+        with open(meta_path) as fh:
+            self.meta = json.load(fh)
+
+    def describe(self) -> str:
+        """One-paragraph summary of the atmosphere baked into these frames."""
+        m = self.meta
+        g, s, ch = m["geometry"], m["seeing"], m["channels"]
+        mag = lambda c: -2.5 * math.log10(ch[c]["atten"])   # noqa: E731
+        return "\n".join([
+            f"  target      Sun {m['target']['alt_deg']:.1f} deg, airmass "
+            f"{m['target']['airmass']:.2f}, {m['target']['P_hPa']:.0f} hPa"
+            f"   (source was {m['source']['alt_deg']:.1f} deg, X "
+            f"{m['source']['airmass']:.2f})",
+            f"  refraction  {g['compression_px']:.1f} px compression along +x "
+            f"({g['compression_percent']:.2f}%), non-affine {g['nonaffine_px']:.1f} px, "
+            f"drift {m['drift']['bulk_px_range'][0]:+.1f}.."
+            f"{m['drift']['bulk_px_range'][1]:+.1f} px",
+            f"  dispersion  R {ch['R']['disp_px_predicted']:+.2f}  "
+            f"G {ch['G']['disp_px_predicted']:+.2f}  "
+            f"B {ch['B']['disp_px_predicted']:+.2f} px along +x",
+            f"  seeing      {s['target_arcsec']:.1f}\" (zenith {s['zenith_arcsec']:.1f}\", "
+            f"X^{s['exponent']:.1f}); blur+wander split by exposure, "
+            f"{s['per_exposure'][0]['added_blur_px_fwhm']:.2f} px + "
+            f"{s['per_exposure'][0]['added_shift_px_rms']:.2f} px rms at "
+            f"{s['per_exposure'][0]['exp_s']:.5f} s",
+            f"  photometry  extinction R {mag('R'):.2f}  G {mag('G'):.2f}  "
+            f"B {mag('B'):.2f} mag, exposure gain x{m['exposure_gain']:.2f}, "
+            f"veiling glare {ch['G']['scattered'] * m['aureole']['fraction_in_frame_kernel']:.1%}",
+            f"  NOT applied {', '.join(m['not_simulated'])}",
+            f"  edges       outer {max(g['edge_extrapolated_px']):.0f} px along x are "
+            f"edge-extended, not real data",
+        ])
 
 
 # --------------------------------------------------------------------------- #
@@ -313,10 +377,14 @@ class NefInjectSource(NefSource):
 # --------------------------------------------------------------------------- #
 #  Construction + reattachment                                                #
 # --------------------------------------------------------------------------- #
-def make_source(input_mode: str, *, jpg_dir=None, nef_dir=None, radiance_npy=None):
+def make_source(input_mode: str, *, jpg_dir=None, nef_dir=None, radiance_npy=None,
+                atmosphere_dir=None):
     if input_mode == "jpg":
         assert jpg_dir is not None, "jpg mode needs jpg_dir"
         return JpgSource(jpg_dir)
+    if input_mode == "atmosphere":
+        assert atmosphere_dir is not None, "atmosphere mode needs atmosphere_dir"
+        return AtmosphereSource(atmosphere_dir)
     if input_mode == "nef":
         assert nef_dir is not None, "nef mode needs nef_dir"
         return NefSource(nef_dir)

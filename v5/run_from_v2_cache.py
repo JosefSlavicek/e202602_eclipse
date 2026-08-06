@@ -45,6 +45,11 @@ def _parse_args():
     ap.add_argument("--nef-dir", type=Path, default=Path("/home/slavik/tmp/eclipse_fake_imgs"))
     ap.add_argument("--merge", choices=["radiometric", "legacy"], default="radiometric")
     ap.add_argument("--n-exposure-refine", type=int, default=None)
+    ap.add_argument("--refine-registration", choices=["on", "off"], default="on",
+                    help="redo the cross-exposure registration on calibrated radiance and "
+                         "refit the calibration on it (one alternation step), as pipeline.py "
+                         "does. The cached v2 registration is a gamma-scaled bootstrap.")
+    ap.add_argument("--refine-space", choices=["log", "linear"], default="log")
     ap.add_argument("--calib-only", action="store_true",
                     help="stop after the calibration (fast: no full-resolution merge)")
     return ap.parse_args()
@@ -78,8 +83,12 @@ def main() -> int:
     assert args.workdir.resolve() != args.cache_dir.resolve(), "refusing to write into the cache"
     args.workdir.mkdir(parents=True, exist_ok=True)
 
+    import math
+
+    import numpy as np
     import torch
     from eclipse_v5 import calib as ca
+    from eclipse_v5 import reregister as rr
     from eclipse_v5 import stage2 as s2
     from eclipse_v5.inputs import attach_source, make_source
     from eclipse_v5.merge import merge_to_composite
@@ -105,15 +114,36 @@ def main() -> int:
             cross_reg = pickle.load(fd)
         exposure_times_sorted = sorted(exposure_groups.keys())[2:]
         n_refine = ca.N_EXPOSURE_REFINE if args.n_exposure_refine is None else args.n_exposure_refine
-        ca.run(exposure_groups, opt_results, exposure_times_sorted, cross_reg,
-               exposure_times_sorted[0], device, n_exposure_refine=n_refine, out_pkl=pk_calib)
+        calib_result = ca.run(
+            exposure_groups, opt_results, exposure_times_sorted, cross_reg,
+            exposure_times_sorted[0], device, n_exposure_refine=n_refine, out_pkl=pk_calib)
+
+        if args.refine_registration == "on":
+            print("\n=== Re-registration: redo the cross-exposure alignment on calibrated radiance ===")
+            source.set_calibration(calib_result)
+            cross_reg_refined, _rows = rr.run(
+                exposure_groups, opt_results, exposure_times_sorted, cross_reg, source, device,
+                space=args.refine_space, out_pkl=args.workdir / "v5-stage2r.pkl",
+            )
+            print("\n=== Recalibration: refit the response on the refined alignment ===")
+            ln_c_before = calib_result.ln_c.copy()
+            calib_result = ca.run(
+                exposure_groups, opt_results, exposure_times_sorted, cross_reg_refined,
+                exposure_times_sorted[0], device, n_exposure_refine=n_refine, out_pkl=pk_calib)
+            d_ln_c = float(np.max(np.abs(calib_result.ln_c - ln_c_before)))
+            print(f"Alternation: max |change in ln c| = {d_ln_c:.5f} "
+                  f"({math.expm1(d_ln_c) * 100:+.2f}% on the worst shutter correction)")
+
         if args.calib_only:
             print("\nCalibration only; stopping before the merge.")
             return 0
 
     print("\n=== Stage 3: reference merge, radial tone, FFT sharpen, RGB ===")
     ctx = Stage3Context(workdir=args.workdir)
-    load_inputs(ctx)
+    load_inputs(
+        ctx,
+        use_refined_registration=(args.merge != "legacy" and args.refine_registration == "on"),
+    )
     attach_source(ctx.exposure_groups, source)
     if args.merge == "legacy":
         print("Merge: LEGACY (v2 per-pair exponent chain + bell weight on encoded values)")

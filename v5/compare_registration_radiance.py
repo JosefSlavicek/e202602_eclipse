@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import pickle
 import sys
 from pathlib import Path
@@ -59,23 +58,18 @@ from eclipse_v5 import calib as ca                                        # noqa
 from eclipse_v5 import stage2 as s2                                       # noqa: E402
 from eclipse_v5.device import configure_cuda_visible_devices, require_cuda  # noqa: E402
 from eclipse_v5.inputs import attach_source, make_source                  # noqa: E402
-from eclipse_v5.merge import average_exposure_radiance                    # noqa: E402
-from eclipse_v5.utils import (                                            # noqa: E402
-    compute_weighted_average,
-    grid_search_registration,
-    moon_median,
+from eclipse_v5.reregister import (                                       # noqa: E402
+    ROT_EVAL_RADIUS_FACTOR,
+    average_radiance,
+    displacement,
+    radiance_pair_images,
+    register_pair,
 )
+from eclipse_v5.utils import compute_weighted_average, moon_median        # noqa: E402
 
 # --- constants ------------------------------------------------------------------------
-COVER_THRESH = 0.5           # same as merge.MIN_STACK_COVER: half a frame's worth of valid
-                             # contributions. Below it the pixel is saturated, off-frame or
-                             # moon, and neither its value nor its neighbours' can be trusted.
-FLOOR_QUANTILE = 0.05        # the log floor, taken on the longer exposure (it measures the
-                             # faint end best). Shared by both images of a pair so the
-                             # additive offset between them survives untouched.
-QUANTILE_SUBSAMPLE = 1 << 22  # torch.quantile refuses very large inputs; stride down to this
-ROT_EVAL_RADIUS_FACTOR = 3.0  # report a rotation delta as the arc it moves at 3 moon radii,
-                              # i.e. out where the corona structure actually lives
+# The radiance path itself lives in `eclipse_v5.reregister`, which is what the pipeline runs;
+# this script only adds the control and the comparison so the two cannot drift apart.
 SIGNIFICANT_PX = 0.1         # grid_search_registration's own resolution floor: below this it
                              # does not refine further, so a smaller delta means nothing
 CONTROL_TOLERANCE_PX = 1e-3  # the control re-runs a deterministic search on identical inputs
@@ -121,16 +115,6 @@ def average_gray(group, opt_results, exp, device):
     return avg_img
 
 
-def average_radiance(group, opt_results, exp, source, device):
-    """Per-exposure average in physical brightness, via the calibrated response."""
-    abs_xy = torch.from_numpy(opt_results[exp]["abs_xy"]).to(device)
-    abs_angle_t = torch.from_numpy(opt_results[exp]["abs_angle_t"]).to(device)
-    Lbar, _var, covered, _moon_out = average_exposure_radiance(
-        group, abs_xy, abs_angle_t, source, device
-    )
-    return Lbar, covered
-
-
 class AverageCache:
     """Rolling cache over consecutive pairs: each exposure is built once, used twice.
 
@@ -170,74 +154,13 @@ class AverageCache:
 
 
 # --------------------------------------------------------------------------- #
-#  Radiance -> registration input                                             #
-# --------------------------------------------------------------------------- #
-def _low_quantile(x, valid, q):
-    """q-quantile of `x` over `valid`, on a strided subsample (torch.quantile caps size)."""
-    v = x[valid]
-    assert v.numel() > 0, "no valid pixels to take a quantile over"
-    if v.numel() > QUANTILE_SUBSAMPLE:
-        v = v[:: (v.numel() // QUANTILE_SUBSAMPLE) + 1]
-    return float(torch.quantile(v.float(), q))
-
-
-def radiance_pair_images(L0, cov0, L1, cov1, space):
-    """Both frames of a pair as one comparable image each, plus the target's valid mask.
-
-    Radiance is already the same physical quantity in both frames, so nothing is scaled
-    here — that is the entire point.  Uncovered pixels (off-frame, moon, saturated) are
-    held at the floor rather than zeroed: a zero is a hard edge that `remove_lowfeq`
-    would smear into every angular frequency, while a constant is exactly what the
-    low-frequency strip is there to remove.  Saturated cores need no special handling
-    beyond that; `clean_polar_fft`'s antiprot clip already flattens the top of the range.
-    """
-    # A pixel no frame covered has Lbar = 0/EPS, and a group of one bad frame can leave a
-    # non-finite behind; either would poison the quantile and then the whole FFT row.
-    valid0 = (cov0 >= COVER_THRESH) & torch.isfinite(L0) & (L0 > 0)
-    valid1 = (cov1 >= COVER_THRESH) & torch.isfinite(L1) & (L1 > 0)
-    floor = _low_quantile(L1, valid1, FLOOR_QUANTILE)
-    assert floor > 0, floor
-
-    def prep(L, valid):
-        x = torch.where(valid, L, torch.full_like(L, floor)).clamp(min=floor)
-        if space == "log":
-            return torch.log(x) - math.log(floor)          # >= 0, common offset kept
-        return x / floor                                   # common factor: argmin unchanged
-
-    # The saturation mask stage 2 approximated by predicting img1's clipping from img0.
-    # Here both exposures state it directly. valid1 is used un-warped: the pair is within
-    # a few tens of pixels of alignment already, and the mask edge sits in the saturated
-    # core where nothing is being matched anyway.
-    apriori_valid = (valid0 & valid1).to(torch.float32)
-    return prep(L0, valid0), prep(L1, valid1), apriori_valid
-
-
-# --------------------------------------------------------------------------- #
 #  Comparison                                                                 #
 # --------------------------------------------------------------------------- #
-def displacement(a, b, r_eval):
-    """(translation px, rotation px at r_eval, total px) between two (si, sj, rot) triples."""
-    d_i = a[0] - b[0]
-    d_j = a[1] - b[1]
-    d_rot_deg = a[2] - b[2]
-    d_trans = math.hypot(d_i, d_j)
-    d_rot_px = abs(math.radians(d_rot_deg)) * r_eval
-    return d_trans, d_rot_px, d_trans + d_rot_px
-
-
 def register_stored_values(img0, img1, gamma, t0, t1, moon0, moon1, device):
     """Stage 2's final registration step, verbatim, on the pickled gamma."""
     scale = (t0 / t1) ** (1.0 / gamma)
     img1_scaled = (img1 * scale).clamp(0.0, 1.0)
     return s2.register_cross_exposure(img0, img1_scaled, moon0, moon1, gamma, t0, t1, device)
-
-
-def register_radiance(x0, x1, apriori_valid, moon0, moon1, device):
-    """Same grid search, same starting bracket, on radiance images and an honest mask."""
-    initial_shift_half = 2.0 * (5.0 * (2.0 + 2.0) + 0.0 + 3.0)   # as stage2.register_cross_exposure
-    return grid_search_registration(
-        x0, x1, moon0, moon1, initial_shift_half, device, apriori_valid=apriori_valid
-    )
 
 
 def main():
@@ -326,7 +249,7 @@ def main():
             x0, x1, apriori_valid = radiance_pair_images(L0, c0, L1, c1, space)
             del L0, L1, c0, c1
             torch.cuda.empty_cache()
-            got = register_radiance(x0, x1, apriori_valid, moon0, moon1, device)
+            got = register_pair(x0, x1, apriori_valid, moon0, moon1, device)
             del x0, x1, apriori_valid
             torch.cuda.empty_cache()
             d = displacement(got, stored, r_eval)

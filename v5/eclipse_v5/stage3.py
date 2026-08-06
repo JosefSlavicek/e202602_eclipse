@@ -42,6 +42,11 @@ MERGE_WEIGHT_SIGMA = 0.2
 VALID_THRESH = 0.9999
 RGB_DIM_QUOTIENTS = (0.25, 0.28, 0.37)
 
+# Cap on how far `_grow_moon_over_no_data` may push the fitted radius. The growth should be a
+# few px (the blanked region is the union of disks spanning 5.94 px of detected radius); more
+# than this means the no-data mask holds something that is not the moon.
+MOON_GROW_MAX_PX = 16.0
+
 # The composite is physical brightness now, while every constant downstream
 # (`_radial_tone_map` breakpoints, `_percentile_stretch`, UNSHARP_WEIGHTS, RGB_DIM_QUOTIENTS)
 # was tuned against v2's encoded composite. This is the one knob provided instead of
@@ -68,7 +73,8 @@ class Stage3Context:
     reg: Any = None                                            # pairwise intra-exposure registration dict from stage0; loaded by load_inputs
     opt_results: Any = None                                    # per-exposure pose optimization (abs_xy, abs_angle_t) from stage1; loaded by load_inputs
     cross_reg: Any = None                                      # (t0,t1) -> (shift_i, shift_j, rotation) cross-exposure reg from stage2; loaded by load_inputs
-    gamma_by_pair: Any = None                                  # (t0,t1) -> gamma brightness scaling from stage2; loaded by load_inputs
+    gamma_by_pair: Any = None                                  # (t0,t1) -> gamma brightness scaling from stage2; read only by the legacy merge; loaded by load_inputs
+    refined_registration: bool = False                         # True when cross_reg came from v5-stage2r.pkl (redone on calibrated radiance); set by load_inputs
     exposure_times_sorted: list[Any] = field(default_factory=list)  # sorted exposure times (shortest two dropped); set by load_inputs
     t_ref: Any = None                                          # reference exposure time (shortest kept); set by load_inputs
     moon_ref: tuple[float, float, float] | None = None         # (i, j, radius) median moon in reference exposure; set by load_inputs
@@ -91,8 +97,9 @@ class Stage3Context:
     no_data_crop: Optional[np.ndarray] = None                  # no_data_mask sliced to crop bounds; set by crop_and_save_composite
     mi_crop: float = 0.0                                       # moon center row in crop coordinates; set by crop_and_save_composite, refined by radial_normalize_display
     mj_crop: float = 0.0                                       # moon center column in crop coordinates; set by crop_and_save_composite, refined by radial_normalize_display
-    moon_r: float = 0.0                                        # moon radius in pixels; set by crop_and_save_composite, refined by radial_normalize_display
-    moon_mask: Optional[np.ndarray] = None                     # boolean mask of pixels inside the moon disk; set by radial_normalize_display
+    moon_r: float = 0.0                                        # moon radius in pixels, grown to cover the blanked region; set by crop_and_save_composite, refined and grown by radial_normalize_display
+    moon_r_fitted: float = 0.0                                 # radius find_moon actually fitted, before the growth; set by radial_normalize_display
+    moon_mask: Optional[np.ndarray] = None                     # boolean mask of the grown moon disk — exactly the region blanked in `display` and the complement of the FFT protection indicator; set by radial_normalize_display
     H_crop: int = 0                                            # pixel height of composite_crop; set by crop_and_save_composite
     W_crop: int = 0                                            # pixel width of composite_crop; set by crop_and_save_composite
     display: Optional[np.ndarray] = None                       # radially tone-mapped grayscale image in [0,1]; set by radial_normalize_display
@@ -482,8 +489,14 @@ def _sliding_diff_smooth_for_sigma(
     return (acc / wsum.clamp(min=1e-9)).cpu().numpy()
 
 
-def load_inputs(ctx: Stage3Context) -> None:
-    """Load stage1/stage2 pickles; set exposure list, reference exposure, and moon prior."""
+def load_inputs(ctx: Stage3Context, use_refined_registration: bool = True) -> None:
+    """Load stage1/stage2 pickles; set exposure list, reference exposure, and moon prior.
+
+    `use_refined_registration` swaps in `v5-stage2r.pkl` — the cross-exposure transforms
+    redone on calibrated radiance — when the pipeline produced one. The legacy merge must
+    pass False: it reproduces v2, gamma chain and all. `gamma_by_pair` always comes from
+    stage 2 and is only ever read by that legacy path.
+    """
     with open(ctx.workdir / "v5-stage1.pkl", "rb") as fd:
         ctx.exposure_groups = pickle.load(fd)
         ctx.reg = pickle.load(fd)
@@ -491,6 +504,17 @@ def load_inputs(ctx: Stage3Context) -> None:
     with open(ctx.workdir / "v5-stage2.pkl", "rb") as fd:
         ctx.cross_reg = pickle.load(fd)
         ctx.gamma_by_pair = pickle.load(fd)
+    refined_pkl = ctx.workdir / "v5-stage2r.pkl"
+    if use_refined_registration:
+        if refined_pkl.exists():
+            from eclipse_v5 import reregister as RR
+
+            ctx.cross_reg, _rows = RR.load(refined_pkl)
+            ctx.refined_registration = True
+            print(f"Using refined cross-exposure registration from {refined_pkl}")
+        else:
+            print(f"NOTE: {refined_pkl} not found — falling back to stage 2's gamma-scaled "
+                  f"alignment. Re-run from --start-stage 3 to produce it.")
     ctx.device = torch.device("cuda")
     # Inherited from v2: the two shortest exposures are dropped, so 15 of 17 are used and
     # t_ref = 0.001. No reason was ever recorded; kept for comparability with v2's numbers.
@@ -751,6 +775,51 @@ def _polar_transform_and_extrapolate(img, center, radius_min, radius_max, n_r, n
     return polar_img, valid_for_mean, valid
 
 
+def _grow_moon_over_no_data(dist_sq, no_data, moon_r_fitted):
+    """Grow the fitted moon circle until it covers every blanked pixel. Returns the radius.
+
+    `find_moon` fits a circle to the boundary of the region the merge blanked, but that region
+    is a pixel map, not a circle: the union of ~15 per-frame disks whose centres differ by
+    registration residuals and whose radii span 5.94 px, bilinear-resampled into reference
+    coordinates and thresholded. Parts of it stick out past the fitted circle.
+
+    Everything downstream models the black area as exactly `dist^2 <= moon_r^2` — the FFT limb
+    protection builds its indicator from the complement of that predicate, the anisotropic blur
+    drops source radii below `moon_r`, and the final blackening uses the disk itself. A pixel
+    that is blank but outside the circle is therefore an unmodelled step edge in the one place
+    the protection exists to guard, and its zeros leak into the blur. Growing the radius to
+    cover them (and blanking the annulus this gains, in `radial_normalize_display`) makes the
+    three agree on one pixel set.
+
+    Assumes the blanked region is the moon disk alone. It can also hold pixels no exposure
+    could measure for other reasons — every exposure saturated or masked — and a single one of
+    those elsewhere in the frame would inflate the radius without bound, so the growth is
+    capped and exceeding the cap is fatal rather than silently clamped.
+    """
+    if no_data is None or not no_data.any():
+        return float(moon_r_fitted)
+    # +1e-3 px: `dist_sq` is float32 and the mask is rebuilt as `dist_sq <= moon_r**2`, so a
+    # bare sqrt can land one ULP low and drop the very pixel that set the radius.
+    r_needed = math.sqrt(float(dist_sq[no_data].max())) + 1e-3
+    grown = max(float(moon_r_fitted), r_needed)
+    growth = grown - float(moon_r_fitted)
+    if growth > MOON_GROW_MAX_PX:  # a gap that is not the moon; see the docstring
+        raise AssertionError(
+            f"blanked region reaches {r_needed:.2f} px from the moon centre, {growth:.2f} px "
+            f"past the fitted radius {moon_r_fitted:.2f} (cap {MOON_GROW_MAX_PX} px). The "
+            f"no-data mask is assumed to be the moon disk alone; this looks like a coverage "
+            f"gap elsewhere in the frame — check the 'coverage gaps outside moon' count "
+            f"printed by merge_to_composite."
+        )
+    if growth > 0:
+        print(f"Moon circle grown {growth:.2f} px to cover the blanked region: "
+              f"r {moon_r_fitted:.2f} -> {grown:.2f}")
+    else:
+        print(f"Moon circle r={moon_r_fitted:.2f} already covers the blanked region "
+              f"(reaches {r_needed:.2f} px); not grown")
+    return grown
+
+
 def _radial_tone_map(img, polar_img, valid_for_mean, center, radius_min, radius_max, n_r, n_theta):
     """Sliding-window polar mean → piecewise-linear tone map; average over two angular window sizes."""
     device = img.device
@@ -847,7 +916,13 @@ def _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n
 
 
 def radial_normalize_display(ctx: Stage3Context) -> None:
-    """Refine moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1])."""
+    """Refine and grow moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1], moon blanked).
+
+    The growth (`_grow_moon_over_no_data`) affects nothing in the normalisation itself — the
+    polar pole is the moon *centre*, `radius_min` is 0, and the extrapolation keys off validity
+    rather than radius, so `moon_r` is read here only to build `ctx.moon_mask`. It matters to
+    the sharpener, which is why the disk is blanked in `ctx.display` on the way out.
+    """
     assert ctx.composite_crop is not None
     device = ctx.device
     composite_crop = ctx.composite_crop
@@ -856,12 +931,22 @@ def radial_normalize_display(ctx: Stage3Context) -> None:
 
     img_rgb = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float32).unsqueeze(-1).expand(-1, -1, 3)
     mi_crop, mj_crop, moon_r = find_moon(img_rgb, float(mi_crop), float(mj_crop))
-    ctx.mi_crop, ctx.mj_crop, ctx.moon_r = float(mi_crop), float(mj_crop), float(moon_r)
+    ctx.mi_crop, ctx.mj_crop = float(mi_crop), float(mj_crop)
+    ctx.moon_r_fitted = float(moon_r)
 
     ii = np.arange(H_crop, dtype=np.float32).reshape(-1, 1)
     jj = np.arange(W_crop, dtype=np.float32).reshape(1, -1)
     dist_sq = (ii - mi_crop) ** 2 + (jj - mj_crop) ** 2
+    moon_r = _grow_moon_over_no_data(dist_sq, ctx.no_data_crop, moon_r)
+    ctx.moon_r = float(moon_r)
     ctx.moon_mask = dist_sq <= (moon_r**2)
+    if ctx.no_data_crop is not None:
+        # The point of the growth: the disk the sharpener models must contain every blanked
+        # pixel, or the ones left out are unprotected step edges right at the limb.
+        assert not np.any(ctx.no_data_crop & ~ctx.moon_mask), (
+            f"{int(np.sum(ctx.no_data_crop & ~ctx.moon_mask))} blanked pixels outside the "
+            f"grown moon disk r={moon_r:.4f}"
+        )
 
     img = torch.from_numpy(composite_crop).to(device=device, dtype=torch.float32)
     center = (float(mi_crop), float(mj_crop))
@@ -877,6 +962,12 @@ def radial_normalize_display(ctx: Stage3Context) -> None:
     display_t = _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n_theta)
 
     ctx.display = display_t.cpu().numpy()
+    # Blank the grown disk in the one array the sharpener reads, so the black region it sees is
+    # exactly the circle its limb protection models — the same predicate, quantization included.
+    # `composite_crop` is deliberately not touched: nothing reads it after this function, and
+    # when the merge left no holes to fill it is the *same object* as `radiance_crop`, the
+    # physical brightness already written to v5-stage3_composite.npy.
+    ctx.display[ctx.moon_mask] = 0.0
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
     ax.imshow(ctx.display, cmap="gray", vmin=0, vmax=1)
     ax.set_title("Radial normalize (polar, torch): mean/2→0.4, 2×mean→1; then (p3,1)→(0,1)")
@@ -916,6 +1007,9 @@ def fft_unsharp_and_save(ctx: Stage3Context) -> None:
     combined_diff = strength_r2 * diff_smooth_r2 + strength_r4 * diff_smooth_r4 + strength_r8 * diff_smooth_r8
     sharpened = display + combined_diff
     sharpened = np.clip(sharpened, 0.0, 1.0)
+    # `display` is already blanked here; this removes what the unsharp put back inside the disk
+    # (the protected limb coefficients reconstruct the step at gain 1, then get multiplied by
+    # the UNSHARP_WEIGHTS).
     sharpened[ctx.moon_mask] = 0.0
     ctx.sharpened_fft_diff = sharpened
 
@@ -997,7 +1091,7 @@ def run(workdir: Path, source=None, use_legacy_merge: bool = False) -> None:
     from eclipse_v5.merge import merge_to_composite
 
     ctx = Stage3Context(workdir=workdir)
-    load_inputs(ctx)
+    load_inputs(ctx, use_refined_registration=not use_legacy_merge)
     if use_legacy_merge:
         build_per_exposure_averages(ctx)
         warp_merge_to_composite(ctx)
