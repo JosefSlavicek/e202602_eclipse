@@ -80,6 +80,13 @@ def _parse_args():
     ap.add_argument("--start-stage", type=int, default=0, choices=[0, 1, 2, 3, 4],
                     help="Resume from an existing run's pickles: 3 skips straight to the "
                          "calibration (registration is ~50 min), 4 to stage 3.")
+    ap.add_argument("--frame-dump", choices=["on", "off"], default="on",
+                    help="Have the merge additionally stream every individual frame's "
+                         "(weight, wval) rasters to <workdir>/frame_dump/, so the composite "
+                         "can later be reconstructed as a flat weighted sum over frames "
+                         "(merge.reconstruct_from_frame_dump). On by default; adds ~180 MiB "
+                         "per frame of disk (tens of GB for a full bracket) and some merge "
+                         "time, so turn it off if that's not wanted for this run.")
     return ap.parse_args()
 
 
@@ -248,7 +255,8 @@ if __name__ == "__main__":
     load_inputs(ctx, use_refined_registration=(args.refine_registration == "on"))
     attach_source(ctx.exposure_groups, source)
     load_calibration(ctx, source, PK_CALIB)
-    merge_to_composite(ctx, source)
+    frame_dump_dir = (WORKDIR / "frame_dump") if args.frame_dump == "on" else None
+    merge_to_composite(ctx, source, frame_dump_dir=frame_dump_dir)
     crop_and_save_composite(ctx)
     radial_normalize_display(ctx)
     fft_unsharp_and_save(ctx)
