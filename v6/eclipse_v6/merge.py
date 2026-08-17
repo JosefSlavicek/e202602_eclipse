@@ -58,20 +58,30 @@ def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
 
         Lbar = sum(m*L) / sum(m)          Vbar = sum(m^2*var) / sum(m)^2
 
-    which is the ordinary variance of a weighted mean, so a group with more frames earns
-    proportionally more weight in the merge with nothing extra to say about it.
+    which is the ordinary variance of a weighted mean for *any* nonnegative weights `m`, not
+    only 0/1 ones — so a group with more frames, or with frames trusted more (source.valid's
+    continuous taper), earns proportionally more weight with nothing extra to say about it.
+
+    `m` (the trust weight, `source.valid`) and `m_geom` (the coverage mask, `source.usable`)
+    are deliberately kept separate. If `covered` were built from the same taper that weights
+    `Lbar`, a pixel every frame genuinely covers but that merely sits in the taper's rolloff
+    would read as "under-covered" and get killed by `MIN_STACK_COVER` in merge_to_composite —
+    reintroducing, at the taper's midpoint, exactly the sharp edge the taper exists to remove.
+    `covered` must answer "did enough frames see this pixel at all", independent of how much
+    any of them is trusted.
 
     `moon_out` is returned separately from `covered` because `covered` also excludes
-    saturated pixels, and the merge needs the moon geometry on its own.
+    unusable (saturated) pixels, and the merge needs the moon geometry on its own.
     """
     n = len(group)
     assert n >= 1, group
-    sum_Lm = sum_varm2 = sum_m = sum_moon = None
+    sum_Lm = sum_varm2 = sum_m = sum_mgeom = sum_moon = None
     for j in range(n):
-        L, var, valid = source.load_radiance(group[j], device)
+        L, var, valid, usable = source.load_radiance(group[j], device)
         H, W = L.shape
         moon_out = _moon_out_mask(group[j], H, W, device)
         m = valid.to(torch.float32) * moon_out
+        m_geom = usable.to(torch.float32) * moon_out
 
         x_j = float(abs_xy[j, 0])
         y_j = float(abs_xy[j, 1])
@@ -79,24 +89,26 @@ def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
         w_Lm = apply_transform_single(L * m, x_j, y_j, theta_j_deg, device)
         w_varm2 = apply_transform_single(var * m * m, x_j, y_j, theta_j_deg, device)
         w_m = apply_transform_single(m, x_j, y_j, theta_j_deg, device)
+        w_mgeom = apply_transform_single(m_geom, x_j, y_j, theta_j_deg, device)
         w_moon = apply_transform_single(moon_out, x_j, y_j, theta_j_deg, device)
-        del L, var, valid, m, moon_out
+        del L, var, valid, usable, m, m_geom, moon_out
 
         if sum_Lm is None:
-            sum_Lm, sum_varm2, sum_m, sum_moon = w_Lm, w_varm2, w_m, w_moon
+            sum_Lm, sum_varm2, sum_m, sum_mgeom, sum_moon = w_Lm, w_varm2, w_m, w_mgeom, w_moon
         else:
             sum_Lm += w_Lm
             sum_varm2 += w_varm2
             sum_m += w_m
+            sum_mgeom += w_mgeom
             sum_moon += w_moon
-            del w_Lm, w_varm2, w_m, w_moon
+            del w_Lm, w_varm2, w_m, w_mgeom, w_moon
 
     denom = sum_m.clamp(min=EPS)
     Lbar = sum_Lm / denom
     Vbar = sum_varm2 / (denom * denom)
-    covered = sum_m / float(n)
+    covered = sum_mgeom / float(n)
     moon_out = sum_moon / float(n)
-    del sum_Lm, sum_varm2, sum_m, sum_moon
+    del sum_Lm, sum_varm2, sum_m, sum_mgeom, sum_moon
     return Lbar, Vbar, covered, moon_out
 
 

@@ -62,6 +62,10 @@ INJECT_SHOT = 2.0 / RAW_SPAN           # signal-dependent shot-noise factor -> [
 JPG_CLIP_LO = 0.02
 JPG_CLIP_HI = 0.98
 NEF_CLIP_HI = 0.99
+NEF_TAPER_PLATEAU = 0.5      # fraction of [0, NEF_CLIP_HI] held at full trust; the outer
+                              # quarters taper smoothly to 0 (Tukey-style) instead of a hard
+                              # cutoff, so a fixed-brightness threshold doesn't trace a ring
+                              # on the (roughly radial) corona
 
 # Placeholders. They set only the *relative* weighting between raw frames, and both are
 # measurable from a flat-field pair: plot variance against mean over many patches and the
@@ -87,6 +91,20 @@ def _interp_lut(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Te
     y0, y1 = fp[idx - 1], fp[idx]
     w = (flat - x0) / (x1 - x0).clamp(min=1e-20)
     return (y0 + w * (y1 - y0)).view_as(x)
+
+
+def _tukey_taper(x: torch.Tensor, lo: float, hi: float, plateau: float = 0.5) -> torch.Tensor:
+    """Continuous trust weight over [lo, hi]: 1.0 on the middle `plateau` fraction, cosine
+    taper down to 0.0 at lo and hi, 0.0 outside. Same shape as a Tukey/Hann window, for the
+    same reason it is used there: a hard edge turns into ringing (here, a literal ring on a
+    radially-falling corona) where a smooth rolloff would not.
+    """
+    edge = (1.0 - plateau) / 2.0
+    u = (x - lo) / (hi - lo)
+    ramp = 0.5 * (1.0 - torch.cos(math.pi * (u / edge).clamp(0.0, 1.0)))
+    fall = 0.5 * (1.0 - torch.cos(math.pi * ((1.0 - u) / edge).clamp(0.0, 1.0)))
+    w = torch.minimum(ramp, fall)
+    return torch.where((u > 0.0) & (u < 1.0), w, torch.zeros_like(w))
 
 
 class FrameSource(ABC):
@@ -167,12 +185,17 @@ class FrameSource(ABC):
         return float(ii.exposure_time) * self.exposure_correction(ii)
 
     def load_radiance(self, ii, device):
-        """(radiance, variance, valid) as float32 (H, W) tensors: physical brightness per pixel.
+        """(radiance, variance, valid, usable) as float32 (H, W) tensors: physical brightness
+        per pixel.
 
         `radiance` is light per unit time — a property of the sky, identical in every frame.
         `variance` is that estimate's own uncertainty squared, which is what the merge weights
-        by. `valid` is False where the stored value cannot be inverted (saturated, or below
-        the format's usable floor).
+        by. `valid` is a continuous [0,1] trust weight — how much this frame's reading should
+        count in the exposure-group average, tapering toward 0 near saturation (and, where
+        modelled, near the usable floor) rather than cutting off sharply. `usable` is the
+        boolean "this frame has *some* reading here at all" (not saturated, above the format's
+        floor) — used only to decide whether enough frames covered a pixel (stack coverage),
+        independent of how much any one of them is trusted.
         """
         raise NotImplementedError(f"{type(self).__name__} has no radiometric model")
 
@@ -241,7 +264,7 @@ class JpgSource(FrameSource):
         sys_sigma = _interp_lut(v, lut["v_sigma"], lut["sigma"])
         var = (self.value_sigma * slope / t_eff) ** 2 + (sys_sigma * radiance) ** 2
         valid = (v > JPG_CLIP_LO) & (v < JPG_CLIP_HI)
-        return radiance, var, valid
+        return radiance, var, valid, valid
 
 
 # --------------------------------------------------------------------------- #
@@ -402,9 +425,13 @@ class NefSource(FrameSource):
         `decoded` (via load_gray) is already dark-subtracted if a dark model is attached; only
         the vignette correction is applied here.
 
-        `valid` tests `decoded`, i.e. after dark subtraction (small, additive, negligible next
-        to the clip threshold) but before the vignette correction (not negligible — a
-        multiplicative correction can meaningfully push a clipped pixel back under threshold).
+        Both `valid` and `usable` test `decoded`, i.e. after dark subtraction (small,
+        additive, negligible next to the clip threshold) but before the vignette correction
+        (not negligible — a multiplicative correction can meaningfully push a clipped pixel
+        back under threshold). `usable` is the hard cutoff (a clipped pixel's true value is
+        lost, no amount of trust-tapering recovers it); `valid` additionally tapers smoothly
+        to 0 near that cutoff (and near 0) so no single stored-value threshold shows up as a
+        ring in the merged composite.
         """
         decoded = self.load_gray(ii, device)
         t_eff = self.effective_exposure(ii)
@@ -419,8 +446,9 @@ class NefSource(FrameSource):
 
         radiance = signal / t_eff
         var = (signal.clamp(min=0.0) / GAIN_E_PER_UNIT + READ_SIGMA ** 2) / (t_eff ** 2)
-        valid = decoded < NEF_CLIP_HI
-        return radiance, var, valid
+        usable = decoded < NEF_CLIP_HI
+        valid = _tukey_taper(decoded, 0.0, NEF_CLIP_HI, NEF_TAPER_PLATEAU)
+        return radiance, var, valid, usable
 
 
 # --------------------------------------------------------------------------- #
