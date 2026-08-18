@@ -1,14 +1,15 @@
-"""Combine the bracket in physical brightness, weighted by each estimate's own uncertainty.
+"""Combine the bracket in physical brightness, weighted by a per-exposure brightness window.
 
 Replaces `stage3.warp_merge_to_composite`, which rescaled *encoded* values down a chain of
-fitted per-pair exponents and averaged them under a hand-shaped bell weight.  Here every
-exposure is converted to brightness independently through the calibrated response
-(`source.load_radiance`) and combined with `w = 1/sigma^2`, so nothing accumulates along a
-ladder and no weight is guessed.
-
-Three behaviours that used to be hand-tuned now fall out of the formula: long exposures
-dominate the faint outer corona, short exposures dominate the bright inner corona, and
-readings from the parts of the response curve we know least well are discounted.
+fitted per-pair exponents and averaged them under a hand-shaped bell weight on the *stored*
+value. Here every exposure is converted to brightness independently through the calibrated
+response (`source.load_radiance`), and each exposure group's cross-exposure weight is a
+smooth window over its own brightness `Lbar`, clamped to `[0, 1/t_eff]`: full trust in the
+middle of that range, tapering to 0 near both ends. Long exposures still dominate the faint
+outer corona and short exposures the bright inner corona, because each exposure's window is
+only ever full-weight for the brightness range that exposure resolves well — but the weight
+curve itself is a fixed hand-shaped window (`_window`, `MERGE_WINDOW_PLATEAU`), not fitted or
+derived from a noise model.
 
 Two things are deliberately kept from v2:
 
@@ -37,6 +38,11 @@ MOON_MARGIN_PX = 2.0         # same limb margin as utils.compute_weighted_averag
 MIN_STACK_COVER = 0.5        # a merged pixel needs half a frame's worth of valid contributions
 REF_COVER_THRESH = 0.999     # inside the reference-grid footprint of this exposure
 MOON_BLANK_THRESH = 0.999    # below this, some exposure called the pixel "moon"
+MERGE_WINDOW_PLATEAU = 0.5   # fraction of [0, 1/t_eff] held at full weight; the outer
+                              # quarters taper smoothly to 0 (Tukey-style) instead of a hard
+                              # cutoff, so no fixed-brightness threshold shows up as a ring
+MERGE_WINDOW_EPS = 1.0e-4    # weight floor added to every _window output so it is never
+                              # exactly 0 at/beyond lo or hi, only ever small
 EPS = 1e-20
 
 
@@ -47,6 +53,20 @@ def _moon_out_mask(ii, H, W, device):
     cols = torch.arange(W, device=device, dtype=torch.float32).view(1, -1).expand(H, W)
     dist = torch.sqrt((rows - mi) ** 2 + (cols - mj) ** 2)
     return (dist > r + MOON_MARGIN_PX).to(torch.float32)
+
+
+def _window(x: torch.Tensor, lo: float, hi: float, plateau: float = MERGE_WINDOW_PLATEAU) -> torch.Tensor:
+    """Continuous weight over [lo, hi]: 1.0 on the middle `plateau` fraction, cosine taper
+    down to (but never below) `MERGE_WINDOW_EPS` at lo/hi and beyond — the merge weight
+    itself, not a noise model. The epsilon floor keeps `sum_w` from landing on exactly 0.0
+    at a pixel purely because every exposure's Lbar happened to clamp to lo or hi there.
+    """
+    edge = (1.0 - plateau) / 2.0
+    u = (x - lo) / (hi - lo)
+    ramp = 0.5 * (1.0 - torch.cos(math.pi * (u / edge).clamp(0.0, 1.0)))
+    fall = 0.5 * (1.0 - torch.cos(math.pi * ((1.0 - u) / edge).clamp(0.0, 1.0)))
+    w = torch.minimum(ramp, fall)
+    return torch.where((u > 0.0) & (u < 1.0), w, torch.zeros_like(w)) + MERGE_WINDOW_EPS
 
 
 def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
@@ -113,10 +133,11 @@ def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
 
 
 def merge_to_composite(ctx, source) -> None:
-    """Inverse-variance merge of every exposure onto the reference grid.
+    """Window-weighted merge of every exposure onto the reference grid.
 
     Sets `ctx.composite` (brightness, `NO_DATA` where nothing could see the pixel),
-    `ctx.composite_variance` (its uncertainty squared, `inf` at `NO_DATA`), `ctx.valid_all`
+    `ctx.composite_variance` (`1/sum(w)`, `inf` at `NO_DATA` — a nominal effective-variance
+    proxy under the window weights below, not a physically derived uncertainty), `ctx.valid_all`
     (mutual geometric coverage, as v2), `ctx.no_data_mask`, and `ctx.exposure_weights` /
     `ctx.exposure_weight_times` — every individual exposure's own weight map in ref coords,
     before summing, for later inspection of which exposure dominated where. That stack is
@@ -150,12 +171,16 @@ def merge_to_composite(ctx, source) -> None:
         Lbar, Vbar, covered, moon_out = average_exposure_radiance(
             group, abs_xy, abs_angle_t, source, device
         )
+        del Vbar  # no longer the weight source; see merge_to_composite's docstring
 
         # Weights are formed here, in this exposure's own frame, and warped already
         # multiplied in. Warping w and Lbar separately would let bilinear interpolation pair
         # a trusted pixel's value with an untrusted neighbour's weight.
-        ok = (covered >= MIN_STACK_COVER) & torch.isfinite(Vbar) & (Vbar > 0) & torch.isfinite(Lbar)
-        w = torch.where(ok, 1.0 / Vbar.clamp(min=EPS), torch.zeros_like(Vbar))
+        t_eff = source.effective_exposure(group[0])
+        hi = 1.0 / t_eff
+        ok = (covered >= MIN_STACK_COVER) & torch.isfinite(Lbar)
+        L_clamped = Lbar.clamp(0.0, hi)
+        w = torch.where(ok, _window(L_clamped, 0.0, hi), torch.zeros_like(Lbar))
         # Zero the values too, not just the weights: an uncovered pixel's Lbar can be inf or
         # nan, and 0 * inf is nan, which would then spread through the warp's interpolation.
         L_ok = torch.where(ok, Lbar, torch.zeros_like(Lbar))
@@ -167,7 +192,7 @@ def merge_to_composite(ctx, source) -> None:
             chain, H_ref, W_ref, device,
         )
         moon_ref = warp_to_ref(moon_out, chain, H_ref, W_ref, device)
-        del Lbar, Vbar, covered, moon_out, ok, w, L_ok
+        del Lbar, covered, moon_out, ok, w, L_ok, L_clamped
 
         inside = (cover >= REF_COVER_THRESH).cpu().numpy()
         w_ref_np = np.where(inside, w_ref.cpu().numpy(), 0.0)

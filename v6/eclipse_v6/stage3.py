@@ -83,9 +83,9 @@ class Stage3Context:
     H_ref: int = 0                                             # pixel height of the reference image; set by build_per_exposure_averages
     W_ref: int = 0                                             # pixel width of the reference image; set by build_per_exposure_averages
     composite: Optional[np.ndarray] = None                     # weighted merge of all exposures in ref coords; encoded values (legacy merge) or physical brightness with NO_DATA holes (merge.merge_to_composite); freed after crop_and_save_composite
-    composite_variance: Optional[np.ndarray] = None            # per-pixel variance of `composite`, inf at NO_DATA; set by merge.merge_to_composite only
+    composite_variance: Optional[np.ndarray] = None            # 1/sum(w) at each pixel of `composite`, inf at NO_DATA -- a nominal effective-variance proxy under merge.merge_to_composite's window weights, not a physical uncertainty; set by merge.merge_to_composite only
     no_data_mask: Optional[np.ndarray] = None                  # pixels no exposure could measure (moon disk + saturated-everywhere); set by merge.merge_to_composite
-    exposure_weights: Optional[np.ndarray] = None               # (n_exp, H_ref, W_ref) each exposure's own 1/sigma^2 weight in ref coords, before summing into composite_variance; set by merge.merge_to_composite only; freed after crop_and_save_composite
+    exposure_weights: Optional[np.ndarray] = None               # (n_exp, H_ref, W_ref) each exposure's own brightness-window weight in ref coords, before summing into composite_variance; set by merge.merge_to_composite only; freed after crop_and_save_composite
     exposure_weight_times: Optional[np.ndarray] = None          # (n_exp,) reported exposure time for each exposure_weights slice, same order; set by merge.merge_to_composite only
     calib: Any = None                                          # CalibResult driving the radiometry; set by load_calibration
     valid_all: Optional[np.ndarray] = None                     # minimum valid coverage map across exposures; set by the merge
@@ -671,10 +671,10 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     cols = np.any(all_valid_mask, axis=0)
     r_lo, r_hi = np.where(rows)[0][[0, -1]]
     c_lo, c_hi = np.where(cols)[0][[0, -1]]
-    r_lo += 16
-    r_hi -= 16
-    c_lo += 16
-    c_hi -= 16
+    r_lo += 24
+    r_hi -= 24
+    c_lo += 24
+    c_hi -= 24
     ctx.r_lo, ctx.r_hi, ctx.c_lo, ctx.c_hi = r_lo, r_hi, c_lo, c_hi
     radiance_crop = composite[r_lo : r_hi + 1, c_lo : c_hi + 1].copy()
     ctx.composite = None

@@ -66,6 +66,11 @@ NEF_TAPER_PLATEAU = 0.5      # fraction of [0, NEF_CLIP_HI] held at full trust; 
                               # quarters taper smoothly to 0 (Tukey-style) instead of a hard
                               # cutoff, so a fixed-brightness threshold doesn't trace a ring
                               # on the (roughly radial) corona
+NEF_TAPER_EPS = 1.0e-7       # trust floor added to every _tukey_taper output so it is never
+                              # exactly 0.0 -- average_exposure_radiance divides by sum(m); an
+                              # exact-0.0 trust for every frame in a group collapses that sum
+                              # toward its EPS clamp and blows up Lbar for legitimately faint
+                              # (near-decoded-0) background pixels
 
 # Placeholders. They set only the *relative* weighting between raw frames, and both are
 # measurable from a flat-field pair: plot variance against mean over many patches and the
@@ -95,16 +100,18 @@ def _interp_lut(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Te
 
 def _tukey_taper(x: torch.Tensor, lo: float, hi: float, plateau: float = 0.5) -> torch.Tensor:
     """Continuous trust weight over [lo, hi]: 1.0 on the middle `plateau` fraction, cosine
-    taper down to 0.0 at lo and hi, 0.0 outside. Same shape as a Tukey/Hann window, for the
-    same reason it is used there: a hard edge turns into ringing (here, a literal ring on a
-    radially-falling corona) where a smooth rolloff would not.
+    taper down to (but never below) `NEF_TAPER_EPS` at lo/hi and beyond. Same shape as a
+    Tukey/Hann window, for the same reason it is used there: a hard edge turns into ringing
+    (here, a literal ring on a radially-falling corona) where a smooth rolloff would not. The
+    epsilon floor keeps a whole exposure group's trust weights from summing to exactly 0.0 at
+    a pixel purely because every frame's stored value happened to clamp to lo or hi there.
     """
     edge = (1.0 - plateau) / 2.0
     u = (x - lo) / (hi - lo)
     ramp = 0.5 * (1.0 - torch.cos(math.pi * (u / edge).clamp(0.0, 1.0)))
     fall = 0.5 * (1.0 - torch.cos(math.pi * ((1.0 - u) / edge).clamp(0.0, 1.0)))
     w = torch.minimum(ramp, fall)
-    return torch.where((u > 0.0) & (u < 1.0), w, torch.zeros_like(w))
+    return torch.where((u > 0.0) & (u < 1.0), w, torch.zeros_like(w)) + NEF_TAPER_EPS
 
 
 class FrameSource(ABC):
