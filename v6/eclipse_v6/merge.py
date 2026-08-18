@@ -11,6 +11,13 @@ only ever full-weight for the brightness range that exposure resolves well — b
 curve itself is a fixed hand-shaped window (`_window`, `MERGE_WINDOW_PLATEAU`), not fitted or
 derived from a noise model.
 
+That window is then scaled by `t_eff * len(group)` — total integration time of the group —
+before summing across exposures. At a given pixel every exposure group is estimating the same
+true radiance, so under a shot-noise-dominated model (`Var(Lbar) ~ L / (t_eff * n)`, `L` common
+to all groups at that pixel) this makes `w` track inverse-variance more closely than the window
+shape alone. It is still an approximation, not a fitted noise model: read noise and systematic
+calibration error, which dominate at the short-exposure end, do not scale this way.
+
 Two things are deliberately kept from v2:
 
   * **Common moon blanking.** The detected moon radius drifts 5.94 px across the bracket
@@ -70,66 +77,54 @@ def _window(x: torch.Tensor, lo: float, hi: float, plateau: float = MERGE_WINDOW
 
 
 def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
-    """Stack one exposure group in brightness. Returns (Lbar, Vbar, covered, moon_out).
+    """Stack one exposure group in brightness. Returns (Lbar, covered, moon_out).
 
     Converting each frame and then averaging the brightnesses — rather than averaging the
     stored values and converting once, as v2 did — matters because `f` is curved: the
     average of encoded values is not the encoding of the average.
 
-        Lbar = sum(m*L) / sum(m)          Vbar = sum(m^2*var) / sum(m)^2
+        Lbar = sum(m*L) / sum(m)
 
-    which is the ordinary variance of a weighted mean for *any* nonnegative weights `m`, not
-    only 0/1 ones — so a group with more frames, or with frames trusted more (source.valid's
-    continuous taper), earns proportionally more weight with nothing extra to say about it.
-
-    `m` (the trust weight, `source.valid`) and `m_geom` (the coverage mask, `source.usable`)
-    are deliberately kept separate. If `covered` were built from the same taper that weights
-    `Lbar`, a pixel every frame genuinely covers but that merely sits in the taper's rolloff
-    would read as "under-covered" and get killed by `MIN_STACK_COVER` in merge_to_composite —
-    reintroducing, at the taper's midpoint, exactly the sharp edge the taper exists to remove.
-    `covered` must answer "did enough frames see this pixel at all", independent of how much
-    any of them is trusted.
+    where `m` is `source.usable` (masked out inside this frame's own moon disk): every
+    reading a frame actually has is trusted equally, not tapered by how close its stored
+    value sits to the clip range — so `Lbar` is a plain mean over the frames that cover a
+    pixel at all. `covered = sum(m)/n` reuses that same mask, so it answers exactly "what
+    fraction of frames covered this pixel", with nothing else folded in.
 
     `moon_out` is returned separately from `covered` because `covered` also excludes
     unusable (saturated) pixels, and the merge needs the moon geometry on its own.
     """
     n = len(group)
     assert n >= 1, group
-    sum_Lm = sum_varm2 = sum_m = sum_mgeom = sum_moon = None
+    sum_Lm = sum_m = sum_moon = None
     for j in range(n):
-        L, var, valid, usable = source.load_radiance(group[j], device)
+        L, _var, usable = source.load_radiance(group[j], device)
         H, W = L.shape
         moon_out = _moon_out_mask(group[j], H, W, device)
-        m = valid.to(torch.float32) * moon_out
-        m_geom = usable.to(torch.float32) * moon_out
+        m = usable.to(torch.float32) * moon_out
 
         x_j = float(abs_xy[j, 0])
         y_j = float(abs_xy[j, 1])
         theta_j_deg = -math.degrees(float(abs_angle_t[j]))
         w_Lm = apply_transform_single(L * m, x_j, y_j, theta_j_deg, device)
-        w_varm2 = apply_transform_single(var * m * m, x_j, y_j, theta_j_deg, device)
         w_m = apply_transform_single(m, x_j, y_j, theta_j_deg, device)
-        w_mgeom = apply_transform_single(m_geom, x_j, y_j, theta_j_deg, device)
         w_moon = apply_transform_single(moon_out, x_j, y_j, theta_j_deg, device)
-        del L, var, valid, usable, m, m_geom, moon_out
+        del L, _var, usable, m, moon_out
 
         if sum_Lm is None:
-            sum_Lm, sum_varm2, sum_m, sum_mgeom, sum_moon = w_Lm, w_varm2, w_m, w_mgeom, w_moon
+            sum_Lm, sum_m, sum_moon = w_Lm, w_m, w_moon
         else:
             sum_Lm += w_Lm
-            sum_varm2 += w_varm2
             sum_m += w_m
-            sum_mgeom += w_mgeom
             sum_moon += w_moon
-            del w_Lm, w_varm2, w_m, w_mgeom, w_moon
+            del w_Lm, w_m, w_moon
 
     denom = sum_m.clamp(min=EPS)
     Lbar = sum_Lm / denom
-    Vbar = sum_varm2 / (denom * denom)
-    covered = sum_mgeom / float(n)
+    covered = sum_m / float(n)
     moon_out = sum_moon / float(n)
-    del sum_Lm, sum_varm2, sum_m, sum_mgeom, sum_moon
-    return Lbar, Vbar, covered, moon_out
+    del sum_Lm, sum_m, sum_moon
+    return Lbar, covered, moon_out
 
 
 def merge_to_composite(ctx, source) -> None:
@@ -168,10 +163,9 @@ def merge_to_composite(ctx, source) -> None:
         group = ctx.exposure_groups[exp]
         abs_xy = torch.from_numpy(ctx.opt_results[exp]["abs_xy"]).to(device)
         abs_angle_t = torch.from_numpy(ctx.opt_results[exp]["abs_angle_t"]).to(device)
-        Lbar, Vbar, covered, moon_out = average_exposure_radiance(
+        Lbar, covered, moon_out = average_exposure_radiance(
             group, abs_xy, abs_angle_t, source, device
         )
-        del Vbar  # no longer the weight source; see merge_to_composite's docstring
 
         # Weights are formed here, in this exposure's own frame, and warped already
         # multiplied in. Warping w and Lbar separately would let bilinear interpolation pair
@@ -181,6 +175,7 @@ def merge_to_composite(ctx, source) -> None:
         ok = (covered >= MIN_STACK_COVER) & torch.isfinite(Lbar)
         L_clamped = Lbar.clamp(0.0, hi)
         w = torch.where(ok, _window(L_clamped, 0.0, hi), torch.zeros_like(Lbar))
+        w = w * (t_eff * len(group))
         # Zero the values too, not just the weights: an uncovered pixel's Lbar can be inf or
         # nan, and 0 * inf is nan, which would then spread through the warp's interpolation.
         L_ok = torch.where(ok, Lbar, torch.zeros_like(Lbar))

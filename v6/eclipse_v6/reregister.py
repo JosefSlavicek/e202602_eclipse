@@ -71,7 +71,7 @@ def average_radiance(group, opt_results, exp, source, device):
     """One exposure's stack mean in physical brightness, on the stage-1 poses."""
     abs_xy = torch.from_numpy(opt_results[exp]["abs_xy"]).to(device)
     abs_angle_t = torch.from_numpy(opt_results[exp]["abs_angle_t"]).to(device)
-    Lbar, _var, covered, _moon_out = average_exposure_radiance(
+    Lbar, covered, _moon_out = average_exposure_radiance(
         group, abs_xy, abs_angle_t, source, device
     )
     return Lbar, covered
