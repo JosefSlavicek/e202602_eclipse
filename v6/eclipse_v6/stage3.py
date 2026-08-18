@@ -671,10 +671,10 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
     cols = np.any(all_valid_mask, axis=0)
     r_lo, r_hi = np.where(rows)[0][[0, -1]]
     c_lo, c_hi = np.where(cols)[0][[0, -1]]
-    r_lo += 24
-    r_hi -= 24
-    c_lo += 24
-    c_hi -= 24
+    r_lo += 32
+    r_hi -= 32
+    c_lo += 32
+    c_hi -= 32
     ctx.r_lo, ctx.r_hi, ctx.c_lo, ctx.c_hi = r_lo, r_hi, c_lo, c_hi
     radiance_crop = composite[r_lo : r_hi + 1, c_lo : c_hi + 1].copy()
     ctx.composite = None
