@@ -108,7 +108,7 @@ def apply_corrections(light_infos, cache_dir: Path, corrected_dir: Path, *,
                 + dark_model.rate.astype(np.float64) * float(ii.exposure_time)
             )
         if flat_model is not None:
-            corrected = corrected / flat_model.evaluate(corrected)
+            corrected = corrected + flat_model.evaluate(corrected)
         np.save(_corrected_path(corrected_dir, ii), corrected.astype(np.float32))
 
 
