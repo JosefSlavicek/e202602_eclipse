@@ -47,12 +47,21 @@ READ_SIGMA = 2.0 / RAW_SPAN            # read noise, in the same [0,1] units
 
 
 def _decode_nef_linear(path: Path) -> np.ndarray:
-    """Decode a .NEF to a linear [0,1] luminance array via rawpy (demosaiced, gamma=1)."""
+    """Decode a .NEF to a linear [0,1] luminance array via rawpy (demosaiced, gamma=1).
+
+    `user_flip=0` is required, not optional: rawpy/libraw's default is to auto-rotate/flip
+    the output according to the camera's own orientation sensor at capture time, so shots
+    taken with the camera physically rotated (portrait vs. landscape, or any other angle)
+    would otherwise come back pre-rotated by different amounts. Every fixed-pattern thing
+    downstream -- dust shadows, vignetting, dark current, pixel (i,j) meaning the same
+    physical photosite across frames at all -- depends on every frame staying in the sensor's
+    own, unrotated layout regardless of how the camera was held.
+    """
     import rawpy
     with rawpy.imread(str(path)) as raw:
         rgb = raw.postprocess(
             gamma=(1, 1), no_auto_bright=True, output_bps=16,
-            user_wb=[1.0, 1.0, 1.0, 1.0],
+            user_wb=[1.0, 1.0, 1.0, 1.0], user_flip=0,
         )
     return (rgb.astype(np.float32).mean(axis=2) / 65535.0)
 
@@ -84,6 +93,10 @@ class NefSource:
         infos = []
         for nef in self._nef_files():
             with rawpy.imread(str(nef)) as raw:
+                # raw_image_visible is the sensor data before rawpy's processing pipeline
+                # runs, so unlike postprocess() (see _decode_nef_linear) it is never
+                # auto-rotated/flipped by the camera's orientation sensor -- already in the
+                # sensor's own unrotated layout, no user_flip equivalent needed here.
                 vis = raw.raw_image_visible
                 # read inside the `with` block — the view is freed on exit
                 h, w = int(vis.shape[0]), int(vis.shape[1])

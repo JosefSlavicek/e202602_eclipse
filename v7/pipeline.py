@@ -61,17 +61,19 @@ def _parse_args():
                          "cache's corrected values, so registration, the light calibration "
                          "and the final merge all see dark-subtracted values.")
     ap.add_argument("--flat-dir", type=Path, default=None,
-                    help="Folder of flat-frame .NEF, all at one exposure time. Default "
-                         "<nef-dir>/flats (mirrors --nef-dir's own <nef-dir>/lights). "
-                         "Only used with --flat-model auto/on.")
+                    help="Folder of flat-frame .NEF, ideally spanning several exposure "
+                         "times (needed to fit the brightness-dependent model -- see "
+                         "flatcal.py). Default <nef-dir>/flats (mirrors --nef-dir's own "
+                         "<nef-dir>/lights). Only used with --flat-model auto/on.")
     ap.add_argument("--flat-model", choices=["auto", "on", "off"], default="auto",
-                    help="Fit a per-pixel flat field (vignetting + chip irregularities) "
-                         "from --flat-dir, averaged and normalized so it corrects a "
-                         "perfectly uniform frame back to itself, and bake it into the "
-                         "rawprep cache's corrected values alongside the dark model -- "
-                         "registration, calibration and the merge all see flat-corrected "
-                         "values. auto: use it if --flat-dir exists, otherwise behave as if "
-                         "flat-model=off. on: require --flat-dir to exist. off: never use one.")
+                    help="Fit a per-pixel flat field (dust shadows + chip sensitivity, not "
+                         "the smooth vignetting) from --flat-dir, grouped by exposure time "
+                         "so the correction can depend on the light frame's own value, and "
+                         "bake it into the rawprep cache's corrected values alongside the "
+                         "dark model -- registration, calibration and the merge all see "
+                         "flat-corrected values. auto: use it if --flat-dir exists, "
+                         "otherwise behave as if flat-model=off. on: require --flat-dir to "
+                         "exist. off: never use one.")
     ap.add_argument("--workdir", type=Path, default=None,
                     help="Default /home/slavik/tmp/eclipse_v7_run, or $ECLIPSE_V7_WORKDIR.")
     ap.add_argument("--exposure-group-subsample", type=int,
@@ -160,7 +162,7 @@ if __name__ == "__main__":
     use_flat = args.flat_model == "on" or (args.flat_model == "auto" and flat_dir.is_dir())
     flat_model = None
     if use_flat:
-        print("\n=== Flat model: per-pixel vignette/sensitivity from the flats/ bracket ===")
+        print("\n=== Flat model: per-pixel, brightness-dependent, from the flats/ bracket ===")
         flat_model = fc.run(flat_dir, dark_model=dark_model, out_pkl=PK_FLAT)
 
     # --- Apply dark/flat ---
