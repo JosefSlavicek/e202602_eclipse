@@ -268,7 +268,10 @@ def test_highpass_edge_mirror_padding():
     result = FC._masked_blur(uniform, np.ones_like(uniform, dtype=bool), sigma=10.0)
     err = float(np.max(np.abs(result - const)))
     print(f"synthetic: uniform-frame edge check, max deviation {err:.2e}")
-    assert err < 1e-9, err
+    # 1e-9 back when the blur ran in fp64; it now runs in fp32 (_BLUR_DTYPE) for GPU speed,
+    # so the floor is fp32 rounding, not the padding -- still >99.99% tighter than any of this
+    # module's real correction tolerances (FLAT_CORR_CLAMP = 0.05).
+    assert err < 1e-4, err
 
 
 def test_evaluate_additive_identity_and_clamp():

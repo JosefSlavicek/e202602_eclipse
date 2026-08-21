@@ -49,6 +49,23 @@ flat correction: `corr` is a residual in the same units as a pixel value, so `a 
 exactly the identity (no correction), not a divide-by-something-near-1. The clamp guards against
 extrapolation the same way the old multiplicative clamp did -- light frames reach brightness
 levels the flats never sampled.
+
+**GPU via torch.** Unlike `darkcal.py`'s cheap 2-parameter fit, this one's actual cost is the
+`sigma=64` Gaussian blur (a few hundred taps wide) run two or three times per frame over a
+full-res sensor image, streamed over every flat frame -- `scipy.ndimage.gaussian_filter` on CPU
+is the bottleneck. The blur, the streamed sums, and the final per-pixel 3x3 solve all run as
+`torch` tensor ops on GPU when one is visible (`_default_device`), CPU otherwise so the small
+synthetic test stays GPU-free. `_masked_blur`/`_flat_weights` keep their original plain-numpy
+in/out signature (thin wrappers around the `_t`-suffixed tensor versions the streamed loop calls
+directly, so per-frame data never round-trips through numpy). `FlatModel` itself is still plain
+numpy -- picklable, no torch -- only the fit's internals moved to GPU.
+
+The blur itself runs in fp32 (`_BLUR_DTYPE`), not fp64: on this class of GPU, fp64 throughput is
+throttled to roughly 1/100th of fp32 (measured on a full-res frame: 4.7s scipy CPU vs. 1.8s fp64
+GPU vs. 0.02s fp32 GPU -- fp64 barely beats CPU, fp32 is what actually fixes the slowness), and a
+smooth vignetting/dust estimate has no need of double precision. The streamed sums and the
+closed-form 3x3 solve around it stay float64, since that part is cheap regardless of dtype and
+it's what the fit's numerical stability actually depends on.
 """
 from __future__ import annotations
 
@@ -57,15 +74,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 import tqdm
-from scipy.ndimage import gaussian_filter
 
 OVERBURN_HI = 0.99                     # raw decoded fraction counting as saturated (matches
                                          # rawprep.py's RAW_OVERBURN_HI convention, duplicated
                                          # to avoid a cross-module import for one constant)
 MIN_FLAT_FRAMES = 3                    # need at least this many flat frames to attempt a fit
                                          # at all (same spirit as darkcal.MIN_DARK_FRAMES)
-FLAT_HIGHPASS_SIGMA_PX = 24.0          # Gaussian sigma separating vignetting (smooth, stays
+FLAT_HIGHPASS_SIGMA_PX = 64.0          # Gaussian sigma separating vignetting (smooth, stays
                                          # out of corr via the blur) from dust/pixel-sensitivity
                                          # artefacts (kept, in corr); also the sigma used to
                                          # judge a pixel's local overburn density
@@ -84,34 +102,126 @@ FLAT_CORR_CLAMP = 0.05                 # evaluate() clamps the additive correcti
                                          # frames reach brightness levels the flats never sampled
 
 
+def _default_device() -> torch.device:
+    """CUDA if visible, CPU otherwise. Production always calls `device.require_cuda()` before
+    reaching this module (see `pipeline.py`), so this only ever falls back to CPU for the small
+    synthetic test, which is sized to run in ~1s either way."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _reflect101_index(size: int, pad: int, device: torch.device, side: str) -> torch.Tensor:
+    """Source index, for each of `pad` positions immediately outside `[0, size)` on `side`,
+    that reproduces `scipy.ndimage`'s `mode="reflect"` (half-sample symmetric, edge value
+    duplicated: `d c b a | a b c d | d c b a`) -- including `pad >= size`, needed only by one
+    tiny unit-test canvas since production images are always far larger than the blur radius.
+    Derivation: the padding is periodic with period `2*size`, alternating a flipped copy of the
+    array and a plain copy as it moves away from the boundary."""
+    k = torch.arange(1, pad + 1, device=device)
+    period = 2 * size
+    kk = (k - 1) % period + 1
+    if side == "left":
+        idx = torch.where(kk <= size, kk - 1, period - kk)
+        return idx.flip(0)   # spatial order: farthest first .. nearest (position -1) last
+    idx = torch.where(kk <= size, size - kk, kk - size - 1)
+    return idx                # spatial order: nearest (position size) first .. farthest last
+
+
+def _reflect_pad_1d(x: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
+    """Pad `x` along `dim` by `pad` on each side with `_reflect101_index`."""
+    if pad == 0:
+        return x
+    size = x.shape[dim]
+    left = x.index_select(dim, _reflect101_index(size, pad, x.device, "left"))
+    right = x.index_select(dim, _reflect101_index(size, pad, x.device, "right"))
+    return torch.cat([left, x, right], dim=dim)
+
+
+def _gaussian_kernel_1d(sigma: float, device: torch.device, dtype: torch.dtype,
+                         truncate: float = 4.0) -> torch.Tensor:
+    """Same kernel `scipy.ndimage.gaussian_filter1d` builds by default: truncated at
+    `truncate` (default 4) standard deviations, normalized to sum to 1."""
+    radius = int(truncate * sigma + 0.5)
+    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    return kernel / kernel.sum()
+
+
+_BLUR_DTYPE = torch.float32   # the blur is a smooth vignetting/dust estimate, not a place that
+                                # needs bit-exact fp64 -- and on this class of GPU fp64 throughput
+                                # is ~100x weaker than fp32 (measured: a sigma=64 blur over a
+                                # full-res frame, 4.7s scipy CPU vs 1.8s fp64 GPU vs 0.02s fp32
+                                # GPU), so this is what actually fixes the reported slowness. The
+                                # streamed sums/solve around it stay float64 for the closed-form
+                                # fit's numerical stability; only this op runs narrower.
+
+
+def _gaussian_blur_2d(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur of a 2-D tensor via two 1-D `conv2d` passes, reflect101-padded
+    to match `scipy.ndimage.gaussian_filter(..., mode="reflect")` (see `_reflect_pad_1d`). Runs
+    in `x`'s own dtype -- callers that want the fp32 fast path cast in first."""
+    kernel = _gaussian_kernel_1d(sigma, x.device, x.dtype)
+    radius = kernel.shape[0] // 2
+    xp = _reflect_pad_1d(x, radius, dim=1)
+    xp = _reflect_pad_1d(xp, radius, dim=0)
+    xp = xp.unsqueeze(0).unsqueeze(0)                      # (1, 1, H+2r, W+2r)
+    x_h = F.conv2d(xp, kernel.view(1, 1, 1, -1))           # (1, 1, H+2r, W)
+    x_v = F.conv2d(x_h, kernel.view(1, 1, -1, 1))          # (1, 1, H, W)
+    return x_v.squeeze(0).squeeze(0)
+
+
+def _masked_blur_t(y: torch.Tensor, valid: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Tensor version of `_masked_blur`, operating in place on the GPU/CPU device `y` already
+    lives on -- what the streamed fit loop calls directly, so per-frame data never round-trips
+    through numpy. See `_masked_blur` for the semantics. The blur itself runs in `_BLUR_DTYPE`
+    (fp32); the result is cast back to `y`'s own dtype (fp64 in the streamed fit)."""
+    orig_dtype = y.dtype
+    y32 = y.to(_BLUR_DTYPE)
+    valid_f = valid.to(_BLUR_DTYPE)
+    num = _gaussian_blur_2d(y32 * valid_f, sigma)
+    den = _gaussian_blur_2d(valid_f, sigma)
+    den_safe = torch.where(den > 1e-6, den, torch.ones_like(den))
+    blurred = num / den_safe
+    if torch.any(den <= 1e-6):
+        blurred = torch.where(den > 1e-6, blurred, _gaussian_blur_2d(y32, sigma))
+    return blurred.to(orig_dtype)
+
+
+def _flat_weights_t(overburn: torch.Tensor, sigma: float, frac_max: float) -> torch.Tensor:
+    """Tensor version of `_flat_weights` -- see there for the semantics. The blur runs in
+    `_BLUR_DTYPE` (fp32); the returned weight is float64, matching the streamed fit's sums."""
+    local_frac = _gaussian_blur_2d(overburn.to(_BLUR_DTYPE), sigma).to(torch.float64)
+    zero = local_frac.new_zeros(())
+    one = local_frac.new_ones(())
+    return torch.where(overburn | (local_frac > frac_max), zero, one)
+
+
 def _masked_blur(y: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
     """Gaussian blur of `y`, normalized so pixels flagged invalid (overburn -- clipped, not a
     real measurement) are excluded from every neighboring pixel's blur, rather than silently
-    pulling it toward the clipped value. `mode="reflect"` mirror-pads at the border for the
-    same reason as before: without it, blur near an edge would mix in fabricated zeros and bias
-    the result there.
+    pulling it toward the clipped value. Mirror-pads at the border for the same reason as
+    before: without it, blur near an edge would mix in fabricated zeros and bias the result
+    there. Runs on GPU when one is visible (`_masked_blur_t`); this wrapper is plain numpy
+    in/out for standalone/test use.
 
     Where a pixel has no valid neighbors at all within the kernel (only possible with a
     contiguous overburn region far larger than `sigma`), falls back to the unmasked blur there
     rather than dividing by ~0.
     """
-    valid_f = valid.astype(np.float64)
-    num = gaussian_filter(y * valid_f, sigma=sigma, mode="reflect")
-    den = gaussian_filter(valid_f, sigma=sigma, mode="reflect")
-    den_safe = np.where(den > 1e-6, den, 1.0)
-    blurred = num / den_safe
-    if np.any(den <= 1e-6):
-        blurred = np.where(den > 1e-6, blurred, gaussian_filter(y, sigma=sigma, mode="reflect"))
-    return blurred
+    device = _default_device()
+    y_t = torch.as_tensor(np.asarray(y, dtype=np.float64), device=device)
+    valid_t = torch.as_tensor(np.asarray(valid, dtype=bool), device=device)
+    return _masked_blur_t(y_t, valid_t, sigma).cpu().numpy()
 
 
 def _flat_weights(overburn: np.ndarray, sigma: float, frac_max: float) -> np.ndarray:
     """Per-pixel reliability weight for one flat frame: 0 at an overburn pixel itself, and 0
     wherever the Gaussian-weighted (same sigma as the blur) local fraction of overburn pixels
     exceeds `frac_max` -- protects against `corr` being computed from a blur that's already
-    biased by nearby saturated pixels, even at a pixel that isn't saturated itself."""
-    local_frac = gaussian_filter(overburn.astype(np.float64), sigma=sigma, mode="reflect")
-    return np.where(overburn | (local_frac > frac_max), 0.0, 1.0)
+    biased by nearby saturated pixels, even at a pixel that isn't saturated itself. Plain numpy
+    in/out wrapper around `_flat_weights_t`; see `_masked_blur` for why."""
+    device = _default_device()
+    overburn_t = torch.as_tensor(np.asarray(overburn, dtype=bool), device=device)
+    return _flat_weights_t(overburn_t, sigma, frac_max).cpu().numpy()
 
 
 # --------------------------------------------------------------------------- #
@@ -155,6 +265,7 @@ def fit_flat_model_from_stack(
     neighborhood_overburn_frac_max: float = NEIGHBORHOOD_OVERBURN_FRAC_MAX,
     min_reliable_range: float = MIN_RELIABLE_RANGE,
     min_flat_frames: int = MIN_FLAT_FRAMES,
+    device: torch.device | None = None,
 ):
     """Stream `frames` (one per entry of `times`) through a per-pixel weighted least-squares
     fit of `corr = a + b*x + c*x**2`.
@@ -163,41 +274,46 @@ def fit_flat_model_from_stack(
     entry of `times`. `dark_model` is anything with `.bias`/`.rate` (H, W) arrays (a
     darkcal.DarkModel or a plain stand-in), evaluated at each frame's own exposure time. The
     keyword parameters are exposed only so a small synthetic test can rescale them to its own
-    tiny canvas; production callers should leave them at the defaults.
+    tiny canvas; production callers should leave them at the defaults. `device` defaults to
+    `_default_device()` (GPU if visible); every per-frame array (blur, weights, accumulated
+    sums) lives on it, so nothing round-trips through numpy until the final result.
 
-    Returns `(a, b, c, used_exposures, n_frames, frame_report, reliable)`.
+    Returns `(a, b, c, used_exposures, n_frames, frame_report, reliable)`, all plain numpy.
     """
+    device = device or _default_device()
     times = np.asarray(times, dtype=np.float64)
     frames = list(frames)
     n = len(frames)
     assert times.shape[0] == n, (times.shape, n, "times and frames length mismatch")
     assert n >= min_flat_frames, f"need >= {min_flat_frames} flat frames, got {n}"
 
+    dark_bias_t = dark_rate_t = None
+    if dark_model is not None:
+        dark_bias_t = torch.as_tensor(np.asarray(dark_model.bias, dtype=np.float64), device=device)
+        dark_rate_t = torch.as_tensor(np.asarray(dark_model.rate, dtype=np.float64), device=device)
+
     S0 = S1 = S2 = S3 = S4 = None
     T0 = T1 = T2 = None
     min_x = max_x = None
     frame_report = []
 
-    for t, raw in zip(times, frames):
-        raw = np.asarray(raw, dtype=np.float64)
-        overburn = raw >= overburn_hi          # raw decode, before dark subtraction
+    for t, raw in zip(times, tqdm.tqdm(frames, desc="flat fit")):
+        x = torch.as_tensor(np.asarray(raw, dtype=np.float64), device=device)
+        overburn = x >= overburn_hi            # raw decode, before dark subtraction
 
-        dark = 0.0
-        if dark_model is not None:
-            dark = (dark_model.bias.astype(np.float64)
-                     + dark_model.rate.astype(np.float64) * float(t))
-        x = raw - dark
+        if dark_bias_t is not None:
+            x = x - (dark_bias_t + dark_rate_t * float(t))
 
-        blurred = _masked_blur(x, ~overburn, highpass_sigma_px)
+        blurred = _masked_blur_t(x, ~overburn, highpass_sigma_px)
         corr = blurred - x
-        w = _flat_weights(overburn, highpass_sigma_px, neighborhood_overburn_frac_max)
+        w = _flat_weights_t(overburn, highpass_sigma_px, neighborhood_overburn_frac_max)
 
         if S0 is None:
-            S0 = np.zeros_like(x); S1 = np.zeros_like(x); S2 = np.zeros_like(x)
-            S3 = np.zeros_like(x); S4 = np.zeros_like(x)
-            T0 = np.zeros_like(x); T1 = np.zeros_like(x); T2 = np.zeros_like(x)
-            min_x = np.full_like(x, np.inf)
-            max_x = np.full_like(x, -np.inf)
+            S0 = torch.zeros_like(x); S1 = torch.zeros_like(x); S2 = torch.zeros_like(x)
+            S3 = torch.zeros_like(x); S4 = torch.zeros_like(x)
+            T0 = torch.zeros_like(x); T1 = torch.zeros_like(x); T2 = torch.zeros_like(x)
+            min_x = torch.full_like(x, float("inf"))
+            max_x = torch.full_like(x, float("-inf"))
 
         wx = w * x
         wx2 = wx * x
@@ -211,48 +327,50 @@ def fit_flat_model_from_stack(
         T2 += wx2 * corr
 
         has_w = w > 0
-        min_x = np.where(has_w, np.minimum(min_x, x), min_x)
-        max_x = np.where(has_w, np.maximum(max_x, x), max_x)
+        min_x = torch.where(has_w, torch.minimum(min_x, x), min_x)
+        max_x = torch.where(has_w, torch.maximum(max_x, x), max_x)
 
         frame_report.append({
             "t": float(t),
-            "n_overburn": int(overburn.sum()),
-            "mean_weight": float(w.mean()),
+            "n_overburn": int(overburn.sum().item()),
+            "mean_weight": float(w.mean().item()),
         })
 
     # Per-pixel weighted OLS for corr = a + b*x + c*x^2: a batched 3x3 closed-form solve, one
     # (symmetric) moment matrix and rhs vector per pixel -- same streamed-sums idea darkcal.py
-    # uses for bias + rate*t, generalized to 3 parameters and a per-pixel x.
+    # uses for bias + rate*t, generalized to 3 parameters and a per-pixel x. Runs as one
+    # batched torch.linalg solve over all H*W pixels at once.
     H, W_ = S0.shape
-    M = np.empty((H, W_, 3, 3), dtype=np.float64)
+    M = torch.empty((H, W_, 3, 3), dtype=torch.float64, device=device)
     M[..., 0, 0] = S0; M[..., 0, 1] = S1; M[..., 0, 2] = S2
     M[..., 1, 0] = S1; M[..., 1, 1] = S2; M[..., 1, 2] = S3
     M[..., 2, 0] = S2; M[..., 2, 1] = S3; M[..., 2, 2] = S4
-    V = np.stack([T0, T1, T2], axis=-1)
+    V = torch.stack([T0, T1, T2], dim=-1)
 
-    det = np.linalg.det(M)
-    nonsingular = np.abs(det) > 1e-12
-    M_safe = np.where(nonsingular[..., None, None], M, np.eye(3))
-    # Explicit (N, 3, 3) / (N, 3, 1) batch shape -- np.linalg.solve's gufunc broadcasting is
-    # ambiguous about which trailing axis of a 3-D rhs is the batch dimension vs. the vector,
-    # so collapse (H, W) into one batch axis rather than rely on it being inferred.
-    coeffs = np.linalg.solve(
+    det = torch.linalg.det(M)
+    nonsingular = det.abs() > 1e-12
+    eye3 = torch.eye(3, dtype=torch.float64, device=device)
+    M_safe = torch.where(nonsingular[..., None, None], M, eye3)
+    coeffs = torch.linalg.solve(
         M_safe.reshape(-1, 3, 3), V.reshape(-1, 3, 1)
     ).reshape(H, W_, 3)
     a_fit, b_fit, c_fit = coeffs[..., 0], coeffs[..., 1], coeffs[..., 2]
 
     reliable = nonsingular & ((max_x - min_x) > min_reliable_range)
-    a = np.where(reliable, a_fit, 0.0)
-    b = np.where(reliable, b_fit, 0.0)
-    c = np.where(reliable, c_fit, 0.0)
+    zero = a_fit.new_zeros(())
+    a = torch.where(reliable, a_fit, zero)
+    b = torch.where(reliable, b_fit, zero)
+    c = torch.where(reliable, c_fit, zero)
 
-    assert np.all(np.isfinite(a)) and np.all(np.isfinite(b)) and np.all(np.isfinite(c)), (
+    assert bool(torch.all(torch.isfinite(a)) and torch.all(torch.isfinite(b))
+                and torch.all(torch.isfinite(c))), (
         "flat model fit produced non-finite values -- check the flats/dark model")
 
     used_exposures = np.asarray(sorted(set(np.round(times, 9))), dtype=np.float64)
     return (
-        a.astype(np.float32), b.astype(np.float32), c.astype(np.float32),
-        used_exposures, n, frame_report, reliable,
+        a.to(torch.float32).cpu().numpy(), b.to(torch.float32).cpu().numpy(),
+        c.to(torch.float32).cpu().numpy(), used_exposures, n, frame_report,
+        reliable.cpu().numpy(),
     )
 
 
@@ -264,7 +382,7 @@ def _flat_files(flat_dir) -> list:
     return sorted(list(flat_dir.glob("*.NEF")) + list(flat_dir.glob("*.nef")))
 
 
-def fit_flat_model(flat_dir, dark_model=None) -> FlatModel:
+def fit_flat_model(flat_dir, dark_model=None, device: torch.device | None = None) -> FlatModel:
     """Decode every flat NEF in `flat_dir` and fit the per-pixel brightness-dependent flat
     model, streaming frame by frame."""
     from eclipse_v7.inputs import _decode_nef_linear
@@ -280,7 +398,7 @@ def fit_flat_model(flat_dir, dark_model=None) -> FlatModel:
             yield _decode_nef_linear(f)
 
     a, b, c, used_exposures, n_frames, frame_report, reliable = fit_flat_model_from_stack(
-        times, _decoded_frames(), dark_model=dark_model)
+        times, _decoded_frames(), dark_model=dark_model, device=device)
     return FlatModel(
         a=a, b=b, c=c, reliable=reliable, exposures=used_exposures, n_frames=n_frames,
         frame_report=frame_report,
@@ -335,9 +453,10 @@ def load(path: Path) -> FlatModel:
         return pickle.load(fd)
 
 
-def run(flat_dir, dark_model=None, out_pkl: Path | None = None) -> FlatModel:
+def run(flat_dir, dark_model=None, out_pkl: Path | None = None,
+        device: torch.device | None = None) -> FlatModel:
     """Fit, report, optionally save."""
-    model = fit_flat_model(flat_dir, dark_model=dark_model)
+    model = fit_flat_model(flat_dir, dark_model=dark_model, device=device)
     print_report(model)
     if out_pkl is not None:
         save(model, out_pkl)
