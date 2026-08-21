@@ -155,7 +155,7 @@ FLAT_CORR_CLAMP = 0.05                 # evaluate() clamps the additive correcti
                                          # in the same [0, 1] units as a dark-subtracted pixel
                                          # value -- guards against extrapolation when light
                                          # frames reach brightness levels the flats never sampled
-FLAT_MODEL_VALUE_THRESHOLD = 0.066387  # 90th percentile of decoded (pre-dark-subtraction)
+FLAT_MODEL_VALUE_THRESHOLD = 0.08  # 90th percentile of decoded (pre-dark-subtraction)
                                          # pixel intensity pooled across the flat bracket's 9
                                          # frames at t=0.02s, measured 2026-08-21 against
                                          # /home/slavik/e202602_eclipse/my_raws/flats. Data at
@@ -165,7 +165,7 @@ FLAT_MODEL_VALUE_THRESHOLD = 0.066387  # 90th percentile of decoded (pre-dark-su
                                          # application time regardless of what the fit would
                                          # predict there -- see FlatModel.apply_masked and the
                                          # module docstring's "Value threshold" section.
-FLAT_MODEL_THRESHOLD_MARGIN_FRAC = 0.9  # apply_masked's cosine taper: full correction at/below
+FLAT_MODEL_THRESHOLD_MARGIN_FRAC = 0.75  # apply_masked's cosine taper: full correction at/below
                                          # this fraction of value_threshold, none at all
                                          # at/above value_threshold itself -- a hard cutoff
                                          # exactly at the fit's own cutoff would put a visible

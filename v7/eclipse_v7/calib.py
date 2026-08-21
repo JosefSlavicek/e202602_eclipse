@@ -47,7 +47,7 @@ N_RADIAL_BINS = 48
 SAMPLES_PER_BIN = 220
 MIN_EXPOSURES_PER_SAMPLE = 2
 N_EXPOSURE_REFINE = 6
-MAX_LN_CORRECTION = math.log(1.25)
+MAX_LN_CORRECTION = math.log(1.02)
 
 MOON_SAMPLE_MARGIN_PX = 8.0  # samples must clear the reference moon by this much
 SAMPLE_COVER_THRESH = 0.999  # a sample pixel must be inside every exposure's warped frame
