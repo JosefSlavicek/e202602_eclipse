@@ -1,62 +1,120 @@
-"""Per-pixel flat field, streamed per flat frame (not grouped by exposure time): each frame
-contributes one `(x, corr, w)` data point per pixel to a per-pixel weighted least-squares fit
-of `corr = a + b*x + c*x**2`, where `x` is that pixel's own dark-subtracted brightness in that
-frame and `corr` is how far the pixel deviates from its local (Gaussian-blurred) smooth trend
--- dust shadows, pixel-to-pixel sensitivity, not the smooth optical vignetting, which is what
-the blur estimates and what stays out of `corr`.
+"""Per-pixel flat field, fit from per-exposure-time averages of the flat bracket: each distinct
+exposure time contributes one `(blurred, corr, w)` data point per pixel to a per-pixel weighted
+least-squares fit of `corr = a + b*blurred + c*blurred**2`, where `blurred` is that exposure's
+local (Gaussian-blurred) smooth trend and `corr = blurred - x` is how far the exposure's own
+(weighted-average, dark-subtracted) value `x` deviates from it -- dust shadows, pixel-to-pixel
+sensitivity, not the smooth optical vignetting, which is what the blur estimates and what
+stays out of `corr`.
 
-**Per-frame processing, not per-group.** Earlier versions of this module grouped flats by
-exposure time and fit across per-group averages. This version drops that entirely: every valid
-flat frame streams through once and contributes directly to a per-pixel closed-form weighted
-least-squares accumulation (the same technique `darkcal.py` uses for `bias + rate*t`,
-generalized to a per-pixel x-value, three parameters instead of two, and a per-datapoint
-weight). This lets one badly-saturated region in one frame get excluded without discarding
-that frame's information for every other pixel, and lets brightness variation across a bracket
-of many exposures feed the fit directly rather than being averaged away first.
+**Regressor is `blurred`, not `x` -- deliberately.** An earlier version of this fit used `x`
+itself (this frame's own noisy pixel value) as the regressor, since that is what
+`FlatModel.evaluate` ultimately has to run on for a light frame. That choice silently injects
+this frame's own per-pixel noise into both sides of the regression at once (`x` directly, and
+`corr = blurred - x` through the `-x` term), which biases the fitted slope toward `-1` by an
+amount that *grows*, not shrinks, with more frames, and can flip its sign entirely when that
+noise is large relative to the pixel's real frame-to-frame brightness swing -- see
+`FlatModel.evaluate_refined` below for how the corrected pixel value is recovered from `x`
+without needing `x` in the fit itself. `blurred` is averaged over thousands of *other* pixels
+(`FLAT_HIGHPASS_SIGMA_PX`-wide), so it carries essentially none of this one pixel's own noise;
+regressing against it instead removes that shared-noise term, and as a side effect also
+recovers the true physical defect strength (`b`/`c` stop being distorted by the fact that `x`
+is itself already the defect-corrupted value being explained).
 
-**Overburn is pixel-level, not frame-level.** Saturation is checked on the raw decode, before
-dark subtraction (same `OVERBURN_HI` convention as `rawprep.py`), before anything else runs on
-a frame. It feeds two separate things: (1) a per-pixel weight `w` for this specific frame
-(`_flat_weights`) -- zero at an overburn pixel itself, and also zero wherever the
-Gaussian-weighted (same sigma as the blur) local density of overburn pixels exceeds
-`NEIGHBORHOOD_OVERBURN_FRAC_MAX`, since a blur computed near enough overburn pixels is itself
-biased even at a pixel that isn't saturated; (2) the blur itself (`_masked_blur`), which
-excludes overburn pixels from its convolution outright (a normalized masked blur,
-`conv(y*valid)/conv(valid)`) rather than letting their wrong, clipped raw value quietly pull
-down neighboring pixels' blur.
+**Grouped by exposure time, deliberately.** An earlier version of this module streamed every
+individual flat frame straight into the regression, one data point per *frame*, specifically to
+avoid an older grouped design where one badly-saturated region in one frame would taint that
+whole exposure's average for every pixel. This version groups again -- for the compute win (one
+`sigma=64` blur per *exposure time* instead of per frame, easily an order of magnitude fewer
+blurs on a real bracket) and the lower-noise `x` it gives the fit -- but fixes the original
+reason grouping was dropped by making the per-exposure average itself a weighted mean that
+excludes invalid pixels per frame (see "Overburn" below), so a saturated region in one frame
+still can't taint that pixel's average, or any other pixel's, in that exposure.
 
-**Per-pixel regression.** For a given pixel, every frame contributes one `(x, corr, w)`: `x`
-is that frame's own dark-subtracted value at this pixel, and `corr` is computed from that same
-value (`blur - x`) -- deliberately the same number on both sides. That shares each frame's own
-noise between the regressor and the response with a fixed -1 coefficient, which biases `b`
-(and `c`) toward more negative than the true effect; the bias does not shrink with more frames
-(more data makes the estimate more *precisely* biased, not less biased) -- accepted here on the
-judgment that a flat bracket's exposure-to-exposure brightness swing should dominate over any
-one frame's own shot/read noise for most pixels. Worth checking for if a fitted `b`/`c` map
-ever looks suspiciously systematic. All frames across every exposure time pool into one
-weighted least-squares solve per pixel (streamed sums, closed form, no `(N, H, W)` stack ever
-materializes) for `corr = a + b*x + c*x**2`.
+**Overburn is pixel-level, checked before averaging.** Saturation is checked on the raw decode,
+before dark subtraction (same `OVERBURN_HI` convention as `rawprep.py`), before anything else
+runs on a frame. Within one exposure's frames, a pixel's weighted average excludes every frame
+where that exact pixel was saturated -- the "outright drop it, don't down-weight it" rule this
+module has always applied to overburn, now applied per pixel during averaging rather than per
+whole frame. This also tracks, per pixel, `bad_frac`: the fraction of that exposure's frames
+which were invalid there. `bad_frac` feeds two things, the per-exposure generalization of what
+the old per-frame design did with a single frame's overburn mask: (1) a per-pixel weight `w` for
+this exposure (`_group_weights`) -- zero wherever a pixel had zero valid frames at all, and also
+zero wherever the Gaussian-weighted (same sigma as the blur) local density of `bad_frac` exceeds
+`NEIGHBORHOOD_OVERBURN_FRAC_MAX`, since a blur computed near a cluster of mostly-invalid pixels
+is itself biased even at a pixel that was fine in every one of its own frames; (2) the blur
+itself (`_masked_blur`), which excludes zero-valid-frame pixels from its convolution outright
+(a normalized masked blur, `conv(y*valid)/conv(valid)`) rather than letting an undefined average
+quietly pull down neighboring pixels' blur.
 
-**Reliability.** A pixel's fit is trusted only if the frames that weighted it (`w == 1`) span
-more than `MIN_RELIABLE_RANGE` of dynamic range (assuming max pixel value 1.0) -- otherwise
-`a = b = c = 0`, i.e. no correction, rather than trusting a fit extrapolated from a narrow
-brightness range. `reliable` on `FlatModel` records which pixels got a real fit.
+**Per-pixel regression.** For a given pixel, every exposure time contributes one `(blurred,
+corr, w)`: `blurred` is that exposure's own local smooth-trend estimate at this pixel, and `corr
+= blurred - x` is how far the exposure's weighted-average value fell from it. Every exposure
+time pools into one weighted least-squares solve per pixel (closed form, no `(N, H, W)` stack of
+individual frames ever materializes -- only one accumulator pair per exposure group, plus the
+group's own running weighted-average accumulators while its frames stream through) for `corr =
+a + b*blurred + c*blurred**2`.
 
-**Additive, not multiplicative.** `FlatModel.evaluate(value)` returns `a + b*value +
-c*value**2`, clamped to `+/- FLAT_CORR_CLAMP`, and `rawprep.apply_corrections` *adds* it to the
-light frame's own dark-subtracted value. This is a departure from the old multiplicative-divide
-flat correction: `corr` is a residual in the same units as a pixel value, so `a = b = c = 0` is
-exactly the identity (no correction), not a divide-by-something-near-1. The clamp guards against
-extrapolation the same way the old multiplicative clamp did -- light frames reach brightness
-levels the flats never sampled.
+**Applying the fit to `x`, not `blurred`, needs a correction of its own.** `FlatModel.evaluate`
+only ever has a light frame's own `x` to work with -- there is no independent `blurred` for a
+light frame's signal (computing one would mean blurring every full-res light frame at
+`FLAT_HIGHPASS_SIGMA_PX` too, just to throw the blur away and keep the correction). Plugging
+`x` directly into `a + b*x + c*x**2` in place of `blurred` is a first-order approximation that
+under-corrects by an amount that grows with the defect's own size (still same-signed, unlike
+the noise bias above -- it never flips) -- since `x` is already offset from `blurred` by the
+very `corr` the model is trying to add back. `evaluate_refined` fixes this with one fixed-point
+step: evaluate once at `x` to get a first-pass corrected estimate, then evaluate again at *that*
+estimate (closer to the true `blurred` than `x` was) for the correction actually applied. See
+`evaluate_refined`'s docstring for the numbers.
+
+**Reliability.** A pixel's fit is trusted only if its 3x3 moment matrix is nonsingular --
+otherwise `a = b = c = 0`, i.e. no correction, rather than solving an ill-posed system. With
+one data point per exposure time, that needs at least 3 exposure groups with distinct `blurred`
+values and nonzero weight at that pixel (fewer, and the matrix is exactly singular). There used
+to also be a minimum-dynamic-range requirement (`MIN_RELIABLE_RANGE`) on top of this, dropped
+because `FLAT_MODEL_VALUE_THRESHOLD` (below) already bounds every pixel's usable range from
+above, to something a full-`[0, 1]`-bracket constant had no way to know about -- nonsingularity
+is what's left to guard the 3-parameter solve itself. `reliable` on `FlatModel` records which
+pixels got a real fit; nothing here checks *how narrow* that fit's own input range was, so a
+fit from a very tight cluster of `blurred` values is trusted exactly like one from a wide
+spread as long as the solve itself is well-posed.
+
+**Value threshold: fit and apply only below it.** `FLAT_MODEL_VALUE_THRESHOLD` is measured
+empirically (the 90th percentile of decoded pixel intensity across the flat bracket's own
+0.02s-exposure frames -- see `FLAT_MODEL_VALUE_THRESHOLD`'s own comment for the exact
+provenance), not derived from anything else in this module. It gates two different things,
+each in the way that suits it:
+
+  - At fit time, it is a hard cutoff on `blurred`, one more multiplicative factor on the
+    per-exposure group weight `w` -- an exposure group is simply invisible to a pixel's
+    regression wherever its own `blurred` is at or above the threshold, exactly as if that
+    exposure had never been shot for that pixel. A hard cutoff is fine here: it only decides
+    which *data* feeds the regression, not a value that ends up rendered.
+  - At apply time (`FlatModel.apply_masked`), a hard cutoff would put a literal seam in the
+    image -- neighboring pixels a hair apart in brightness, one corrected and one not. Instead
+    the correction is blended out smoothly: full correction (weight 1.0) at/below
+    `FLAT_MODEL_THRESHOLD_MARGIN_FRAC * value_threshold`, none at all (weight 0.0) at/above
+    `value_threshold`, a raised-cosine taper (zero slope at both ends, so no kink either) over
+    the margin between them. See `FlatModel._threshold_weight`.
+
+Both still key off the same threshold on purpose: nothing above it ever influenced the fit, so
+nothing above it should ever be treated as something the fit can trust a correction from.
+
+**Additive, not multiplicative.** `FlatModel.evaluate_refined(value)` returns something in the
+same units as `value` itself, clamped (per `evaluate` call) to `+/- FLAT_CORR_CLAMP`, and
+`rawprep.apply_corrections` *adds* it to the light frame's own dark-subtracted value. This is a
+departure from the old multiplicative-divide flat correction: `corr` is a residual in the same
+units as a pixel value, so `a = b = c = 0` is exactly the identity (no correction), not a
+divide-by-something-near-1. The clamp guards against extrapolation the same way the old
+multiplicative clamp did -- light frames reach brightness levels the flats never sampled.
 
 **GPU via torch.** Unlike `darkcal.py`'s cheap 2-parameter fit, this one's actual cost is the
-`sigma=64` Gaussian blur (a few hundred taps wide) run two or three times per frame over a
-full-res sensor image, streamed over every flat frame -- `scipy.ndimage.gaussian_filter` on CPU
-is the bottleneck. The blur, the streamed sums, and the final per-pixel 3x3 solve all run as
-`torch` tensor ops on GPU when one is visible (`_default_device`), CPU otherwise so the small
-synthetic test stays GPU-free. `_masked_blur`/`_flat_weights` keep their original plain-numpy
-in/out signature (thin wrappers around the `_t`-suffixed tensor versions the streamed loop calls
+`sigma=64` Gaussian blur (a few hundred taps wide) run two or three times per *exposure time*
+over a full-res sensor image -- `scipy.ndimage.gaussian_filter` on CPU is the bottleneck.
+Grouping by exposure (see above) is what keeps this to a handful of blurs total rather than one
+per frame. The blur, the weighted-average accumulation, and the final per-pixel 3x3 solve all
+run as `torch` tensor ops on GPU when one is visible (`_default_device`), CPU otherwise so the
+small synthetic test stays GPU-free. `_masked_blur`/`_group_weights` keep their original plain-
+numpy in/out signature (thin wrappers around the `_t`-suffixed tensor versions the fit calls
 directly, so per-frame data never round-trips through numpy). `FlatModel` itself is still plain
 numpy -- picklable, no torch -- only the fit's internals moved to GPU.
 
@@ -87,19 +145,32 @@ FLAT_HIGHPASS_SIGMA_PX = 64.0          # Gaussian sigma separating vignetting (s
                                          # out of corr via the blur) from dust/pixel-sensitivity
                                          # artefacts (kept, in corr); also the sigma used to
                                          # judge a pixel's local overburn density
-NEIGHBORHOOD_OVERBURN_FRAC_MAX = 0.10  # a pixel's weight is zeroed in a frame if more than
-                                         # this fraction of its Gaussian-weighted neighborhood
-                                         # (same sigma as the blur) is itself overburn --
-                                         # protects against a blur that's already biased by
-                                         # nearby clipped pixels
-MIN_RELIABLE_RANGE = 0.5               # a pixel's fit is trusted only if the frames that
-                                         # weighted it span more than this much dynamic range
-                                         # (assuming max pixel value 1.0); otherwise falls back
-                                         # to a = b = c = 0 (no correction)
+NEIGHBORHOOD_OVERBURN_FRAC_MAX = 0.10  # a pixel's weight is zeroed in an exposure group if
+                                         # more than this fraction of its Gaussian-weighted
+                                         # neighborhood (same sigma as the blur) was, on
+                                         # average, invalid across that group's frames --
+                                         # protects against a blur that's already biased by a
+                                         # nearby cluster of mostly-clipped pixels
 FLAT_CORR_CLAMP = 0.05                 # evaluate() clamps the additive correction to +/- this,
                                          # in the same [0, 1] units as a dark-subtracted pixel
                                          # value -- guards against extrapolation when light
                                          # frames reach brightness levels the flats never sampled
+FLAT_MODEL_VALUE_THRESHOLD = 0.066387  # 90th percentile of decoded (pre-dark-subtraction)
+                                         # pixel intensity pooled across the flat bracket's 9
+                                         # frames at t=0.02s, measured 2026-08-21 against
+                                         # /home/slavik/e202602_eclipse/my_raws/flats. Data at
+                                         # or above this is excluded from the fit (a
+                                         # multiplicative gate on the per-exposure weight,
+                                         # alongside overburn) and left uncorrected at
+                                         # application time regardless of what the fit would
+                                         # predict there -- see FlatModel.apply_masked and the
+                                         # module docstring's "Value threshold" section.
+FLAT_MODEL_THRESHOLD_MARGIN_FRAC = 0.9  # apply_masked's cosine taper: full correction at/below
+                                         # this fraction of value_threshold, none at all
+                                         # at/above value_threshold itself -- a hard cutoff
+                                         # exactly at the fit's own cutoff would put a visible
+                                         # seam in the image; this fades it out over the margin
+                                         # instead. See FlatModel._threshold_weight.
 
 
 def _default_device() -> torch.device:
@@ -186,13 +257,78 @@ def _masked_blur_t(y: torch.Tensor, valid: torch.Tensor, sigma: float) -> torch.
     return blurred.to(orig_dtype)
 
 
-def _flat_weights_t(overburn: torch.Tensor, sigma: float, frac_max: float) -> torch.Tensor:
-    """Tensor version of `_flat_weights` -- see there for the semantics. The blur runs in
-    `_BLUR_DTYPE` (fp32); the returned weight is float64, matching the streamed fit's sums."""
-    local_frac = _gaussian_blur_2d(overburn.to(_BLUR_DTYPE), sigma).to(torch.float64)
+def _group_weights_t(
+    bad_frac: torch.Tensor, valid_group: torch.Tensor, sigma: float, frac_max: float
+) -> torch.Tensor:
+    """Tensor version of `_group_weights` -- see there for the semantics. The blur runs in
+    `_BLUR_DTYPE` (fp32); the returned weight is float64, matching the fit's sums."""
+    local_frac = _gaussian_blur_2d(bad_frac.to(_BLUR_DTYPE), sigma).to(torch.float64)
     zero = local_frac.new_zeros(())
     one = local_frac.new_ones(())
-    return torch.where(overburn | (local_frac > frac_max), zero, one)
+    return torch.where(~valid_group | (local_frac > frac_max), zero, one)
+
+
+def _group_average_t(
+    raw_frames, t: float, dark_bias_t, dark_rate_t, overburn_hi: float, device: torch.device
+):
+    """Tensor version of `group_average` -- see there for the semantics. `raw_frames` is an
+    iterable of (H, W) arrays, one exposure group's raw decoded frames (pre-dark-subtraction).
+    Returns `(avg_x, valid_group, bad_frac, n_overburn_total)`, tensors on `device` plus a plain
+    int, so the fit loop that calls this directly never round-trips through numpy."""
+    sum_w = sum_wx = None
+    n = 0
+    n_overburn_total = 0
+    for raw in raw_frames:
+        x = torch.as_tensor(np.asarray(raw, dtype=np.float64), device=device)
+        overburn = x >= overburn_hi            # raw decode, before dark subtraction
+        n_overburn_total += int(overburn.sum().item())
+
+        if dark_bias_t is not None:
+            x = x - (dark_bias_t + dark_rate_t * float(t))
+
+        valid = (~overburn).to(torch.float64)
+        if sum_w is None:
+            sum_w = torch.zeros_like(x)
+            sum_wx = torch.zeros_like(x)
+        sum_w += valid
+        sum_wx += valid * x
+        n += 1
+
+    valid_group = sum_w > 0                          # >=1 valid frame at this pixel
+    sum_w_safe = torch.where(valid_group, sum_w, torch.ones_like(sum_w))
+    avg_x = torch.where(valid_group, sum_wx / sum_w_safe, torch.zeros_like(sum_wx))
+    # Fraction of this group's frames that were invalid at each pixel -- the per-exposure
+    # generalization of a single frame's boolean overburn mask (pushback 3 / option A: see
+    # the module docstring's "Overburn is pixel-level" section).
+    bad_frac = 1.0 - sum_w / n
+    return avg_x, valid_group, bad_frac, n_overburn_total
+
+
+def group_average(
+    raw_frames, t: float, dark_model=None, overburn_hi: float = OVERBURN_HI,
+    device: torch.device | None = None,
+):
+    """Per-pixel weighted mean of one exposure group's raw decoded flat frames
+    (pre-dark-subtraction), excluding a frame's own overburn pixels outright from that pixel's
+    mean -- the exact averaging `fit_flat_model_from_stack` uses per exposure group. Exposed
+    (not `_`-prefixed) so callers outside this module -- e.g. a debug script visualizing what
+    the fit actually saw -- compute the identical average rather than a plain, unweighted one
+    that would silently disagree with it whenever a flat has any overburn at all.
+
+    `dark_model` is anything with `.bias`/`.rate` (H, W) arrays, evaluated at `t`. Returns
+    `(avg_x, valid_group, bad_frac)`, all plain numpy: `avg_x` is dark-subtracted (if
+    `dark_model` given) and 0 wherever `valid_group` is False (no frame was ever valid there);
+    `bad_frac` is the fraction of this group's frames invalid at each pixel (see
+    `_group_weights`).
+    """
+    device = device or _default_device()
+    dark_bias_t = dark_rate_t = None
+    if dark_model is not None:
+        dark_bias_t = torch.as_tensor(np.asarray(dark_model.bias, dtype=np.float64), device=device)
+        dark_rate_t = torch.as_tensor(np.asarray(dark_model.rate, dtype=np.float64), device=device)
+    avg_x, valid_group, bad_frac, _n_overburn = _group_average_t(
+        raw_frames, t, dark_bias_t, dark_rate_t, overburn_hi, device)
+    return avg_x.cpu().numpy(), valid_group.cpu().numpy(), bad_frac.cpu().numpy()
 
 
 def _masked_blur(y: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
@@ -213,15 +349,20 @@ def _masked_blur(y: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
     return _masked_blur_t(y_t, valid_t, sigma).cpu().numpy()
 
 
-def _flat_weights(overburn: np.ndarray, sigma: float, frac_max: float) -> np.ndarray:
-    """Per-pixel reliability weight for one flat frame: 0 at an overburn pixel itself, and 0
-    wherever the Gaussian-weighted (same sigma as the blur) local fraction of overburn pixels
-    exceeds `frac_max` -- protects against `corr` being computed from a blur that's already
-    biased by nearby saturated pixels, even at a pixel that isn't saturated itself. Plain numpy
-    in/out wrapper around `_flat_weights_t`; see `_masked_blur` for why."""
+def _group_weights(
+    bad_frac: np.ndarray, valid_group: np.ndarray, sigma: float, frac_max: float
+) -> np.ndarray:
+    """Per-pixel reliability weight for one exposure group: 0 wherever a pixel had zero valid
+    (non-overburn) frames in this group at all (`~valid_group`), and 0 wherever the
+    Gaussian-weighted (same sigma as the blur) local density of `bad_frac` -- the per-pixel
+    fraction of this group's frames that were invalid -- exceeds `frac_max`. Protects against
+    `corr` being computed from a blur that's already biased by a nearby cluster of
+    mostly-invalid pixels, even at a pixel that was fine in every one of its own frames. Plain
+    numpy in/out wrapper around `_group_weights_t`; see `_masked_blur` for why."""
     device = _default_device()
-    overburn_t = torch.as_tensor(np.asarray(overburn, dtype=bool), device=device)
-    return _flat_weights_t(overburn_t, sigma, frac_max).cpu().numpy()
+    bad_frac_t = torch.as_tensor(np.asarray(bad_frac, dtype=np.float64), device=device)
+    valid_group_t = torch.as_tensor(np.asarray(valid_group, dtype=bool), device=device)
+    return _group_weights_t(bad_frac_t, valid_group_t, sigma, frac_max).cpu().numpy()
 
 
 # --------------------------------------------------------------------------- #
@@ -231,9 +372,9 @@ def _flat_weights(overburn: np.ndarray, sigma: float, frac_max: float) -> np.nda
 class FlatModel:
     """Everything `rawprep.apply_corrections` needs. Plain numpy -- picklable, no torch.
 
-    The correction depends on the light frame's own value: `evaluate(value)` computes
-    `a + b*value + c*value**2`, clamped to `+/- FLAT_CORR_CLAMP`, meant to be *added* to the
-    light frame's own dark-subtracted value. `a = b = c = 0` where `reliable` is False.
+    `a`/`b`/`c` were fit against `blurred` (see the module docstring), not against a light
+    frame's own raw value -- so applying the correction to a light frame is `apply_masked`, not
+    the raw `evaluate`. `a = b = c = 0` where `reliable` is False.
     """
 
     a: np.ndarray              # (H, W) float32, intercept
@@ -243,16 +384,71 @@ class FlatModel:
                                  # trust the fit (False => a = b = c = 0)
     exposures: np.ndarray      # (n_exposures,) float64, distinct exposure times seen
     n_frames: int              # total flat frames streamed through the fit
+    value_threshold: float     # data at/above this never entered the fit (see the module
+                                 # docstring's "Value threshold" section) and is never
+                                 # corrected by apply_masked either
     frame_report: list = field(default_factory=list)   # see print_report / fit_flat_model
 
     def evaluate(self, value: np.ndarray) -> np.ndarray:
-        """`a + b*value + c*value**2`, clamped to `+/- FLAT_CORR_CLAMP`. `value` is the light
-        frame's own dark-subtracted signal, same shape as `a`/`b`/`c`. Meant to be *added* to
-        that value, not divided into it."""
+        """`a + b*value + c*value**2`, clamped to `+/- FLAT_CORR_CLAMP`. The fit's `value` axis
+        is `blurred`, a smooth, near-noise-free estimate of the pixel's true brightness (see
+        the module docstring) -- calling this directly on a light frame's own raw value is only
+        a first-order approximation of the correction that value actually needs; use
+        `apply_masked` for what `rawprep.apply_corrections` actually applies."""
         v = value.astype(np.float64) if isinstance(value, np.ndarray) else float(value)
         corr = (self.a.astype(np.float64) + self.b.astype(np.float64) * v
                 + self.c.astype(np.float64) * v ** 2)
         return np.clip(corr, -FLAT_CORR_CLAMP, FLAT_CORR_CLAMP)
+
+    def evaluate_refined(self, value: np.ndarray) -> np.ndarray:
+        """The correction actually meant to be added to a light frame's dark-subtracted `value`.
+
+        `a`/`b`/`c` are a function of `blurred`, which a light frame doesn't have (computing one
+        would mean a full `FLAT_HIGHPASS_SIGMA_PX` blur of every light frame just to throw it
+        away again). `evaluate(value)` -- plugging the raw value in where `blurred` belongs --
+        under-corrects, by an amount that grows with the defect's own size: `value` is already
+        offset from the true `blurred` by roughly the correction being solved for, so evaluating
+        at `value` instead of at the (unknown) true `blurred` misses part of the curve.
+
+        One fixed-point refinement step recovers most of that: evaluate once at `value` to get a
+        first-pass corrected estimate, then evaluate again at *that* estimate, which sits closer
+        to the true `blurred` than `value` did. On the module's own synthetic stress-test defect
+        (15%/20% linear/quadratic, far larger than a real dust/sensitivity artifact), this took
+        the residual error from ~8% (one-shot `evaluate(value)`) down to ~3% at the top of the
+        bracket; for the percent-scale defects flats actually see, the remaining residual after
+        this step should be negligible. Unlike the noise bias `blurred`-regression already fixes,
+        this residual never changes sign -- it only ever under-corrects.
+        """
+        first_pass = value + self.evaluate(value)
+        return self.evaluate(first_pass)
+
+    def _threshold_weight(self, value: np.ndarray) -> np.ndarray:
+        """1.0 at/below `FLAT_MODEL_THRESHOLD_MARGIN_FRAC * value_threshold`, 0.0 at/above
+        `value_threshold`, a raised-cosine taper over the margin between -- zero slope at both
+        ends, so `apply_masked`'s blend has no seam and no kink at either edge of the margin."""
+        lo = FLAT_MODEL_THRESHOLD_MARGIN_FRAC * self.value_threshold
+        hi = self.value_threshold
+        v = value.astype(np.float64) if isinstance(value, np.ndarray) else float(value)
+        u = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
+        return 0.5 * (1.0 + np.cos(np.pi * u))
+
+    def apply_masked(self, value: np.ndarray) -> np.ndarray:
+        """The value to use in place of a light frame's dark-subtracted `value` -- what
+        `rawprep.apply_corrections` actually calls.
+
+        The fit never saw data at or above `value_threshold` (see the module docstring's
+        "Value threshold" section), so evaluating the fitted curve there would be extrapolation
+        onto brightness the flats never sampled, not correction. This always runs
+        `evaluate_refined` over the whole array (simpler than branching per pixel, and the
+        result is blended away where it's not wanted), then blends it against `value` itself by
+        `_threshold_weight`: full correction well below the threshold, none at or above it, a
+        smooth cosine taper over the margin between -- so two neighboring pixels a hair apart in
+        brightness, one just under the threshold and one just over, don't come out of this with
+        a visible seam between "corrected" and "untouched".
+        """
+        corrected = value + self.evaluate_refined(value)
+        w = self._threshold_weight(value)
+        return w * corrected + (1.0 - w) * value
 
 
 # --------------------------------------------------------------------------- #
@@ -263,20 +459,27 @@ def fit_flat_model_from_stack(
     highpass_sigma_px: float = FLAT_HIGHPASS_SIGMA_PX,
     overburn_hi: float = OVERBURN_HI,
     neighborhood_overburn_frac_max: float = NEIGHBORHOOD_OVERBURN_FRAC_MAX,
-    min_reliable_range: float = MIN_RELIABLE_RANGE,
     min_flat_frames: int = MIN_FLAT_FRAMES,
+    value_threshold: float = FLAT_MODEL_VALUE_THRESHOLD,
     device: torch.device | None = None,
 ):
-    """Stream `frames` (one per entry of `times`) through a per-pixel weighted least-squares
-    fit of `corr = a + b*x + c*x**2`.
+    """Average `frames` (one per entry of `times`) within each distinct exposure time, then run
+    one per-pixel weighted least-squares fit of `corr = a + b*blurred + c*blurred**2` over those
+    per-exposure averages.
 
-    `frames` is any iterable of (H, W) arrays, raw decoded (pre-dark-subtraction), one per
-    entry of `times`. `dark_model` is anything with `.bias`/`.rate` (H, W) arrays (a
+    `frames` is any iterable of (H, W) arrays, raw decoded (pre-dark-subtraction), one per entry
+    of `times`. `dark_model` is anything with `.bias`/`.rate` (H, W) arrays (a
     darkcal.DarkModel or a plain stand-in), evaluated at each frame's own exposure time. The
     keyword parameters are exposed only so a small synthetic test can rescale them to its own
     tiny canvas; production callers should leave them at the defaults. `device` defaults to
-    `_default_device()` (GPU if visible); every per-frame array (blur, weights, accumulated
-    sums) lives on it, so nothing round-trips through numpy until the final result.
+    `_default_device()` (GPU if visible); every array (weighted-average accumulators, blur,
+    weights, the fit's own sums) lives on it, so nothing round-trips through numpy until the
+    final result.
+
+    `value_threshold` gates which exposure groups a pixel's regression ever sees: a group is
+    invisible to a pixel wherever that group's own `blurred` is at or above the threshold (see
+    the module docstring's "Value threshold" section) -- exactly as if that exposure had never
+    been shot for that pixel.
 
     Returns `(a, b, c, used_exposures, n_frames, frame_report, reliable)`, all plain numpy.
     """
@@ -292,54 +495,65 @@ def fit_flat_model_from_stack(
         dark_bias_t = torch.as_tensor(np.asarray(dark_model.bias, dtype=np.float64), device=device)
         dark_rate_t = torch.as_tensor(np.asarray(dark_model.rate, dtype=np.float64), device=device)
 
+    times_r = np.round(times, 9)
+    group_idx: dict[float, list[int]] = {}
+    for i, t in enumerate(times_r):
+        group_idx.setdefault(float(t), []).append(i)
+
     S0 = S1 = S2 = S3 = S4 = None
     T0 = T1 = T2 = None
-    min_x = max_x = None
     frame_report = []
 
-    for t, raw in zip(times, tqdm.tqdm(frames, desc="flat fit")):
-        x = torch.as_tensor(np.asarray(raw, dtype=np.float64), device=device)
-        overburn = x >= overburn_hi            # raw decode, before dark subtraction
+    for t in sorted(group_idx):
+        idxs = group_idx[t]
+        # Weighted average within this exposure: a frame's own overburn pixels are excluded
+        # outright from the sum, not merely down-weighted, so one saturated region in one frame
+        # can't pull that pixel's average toward the clipped value -- while every other pixel in
+        # that same frame, and every other frame's contribution to *this* pixel, is unaffected.
+        # Shared with `group_average` (the public numpy wrapper) so anything visualizing what
+        # the fit saw -- e.g. a debug script -- computes the identical average, not a plain one.
+        raw_frames = (frames[i] for i in tqdm.tqdm(idxs, desc=f"flat average t={t:.6f}"))
+        avg_x, valid_group, bad_frac, n_overburn_total = _group_average_t(
+            raw_frames, t, dark_bias_t, dark_rate_t, overburn_hi, device)
 
-        if dark_bias_t is not None:
-            x = x - (dark_bias_t + dark_rate_t * float(t))
-
-        blurred = _masked_blur_t(x, ~overburn, highpass_sigma_px)
-        corr = blurred - x
-        w = _flat_weights_t(overburn, highpass_sigma_px, neighborhood_overburn_frac_max)
+        blurred = _masked_blur_t(avg_x, valid_group, highpass_sigma_px)
+        corr = blurred - avg_x
+        w = _group_weights_t(bad_frac, valid_group, highpass_sigma_px, neighborhood_overburn_frac_max)
+        # Value threshold: this exposure is invisible to a pixel's regression wherever its own
+        # blurred value is at or above value_threshold -- see the module docstring's "Value
+        # threshold" section.
+        w = w * (blurred < value_threshold).to(torch.float64)
 
         if S0 is None:
-            S0 = torch.zeros_like(x); S1 = torch.zeros_like(x); S2 = torch.zeros_like(x)
-            S3 = torch.zeros_like(x); S4 = torch.zeros_like(x)
-            T0 = torch.zeros_like(x); T1 = torch.zeros_like(x); T2 = torch.zeros_like(x)
-            min_x = torch.full_like(x, float("inf"))
-            max_x = torch.full_like(x, float("-inf"))
+            S0 = torch.zeros_like(avg_x); S1 = torch.zeros_like(avg_x); S2 = torch.zeros_like(avg_x)
+            S3 = torch.zeros_like(avg_x); S4 = torch.zeros_like(avg_x)
+            T0 = torch.zeros_like(avg_x); T1 = torch.zeros_like(avg_x); T2 = torch.zeros_like(avg_x)
 
-        wx = w * x
-        wx2 = wx * x
+        # Regressor is `blurred`, not `x` -- see the module docstring ("Regressor is `blurred`,
+        # not `x`") for why: using `x` here would feed this exposure's own noise into both sides
+        # of the fit at once.
+        wb = w * blurred
+        wb2 = wb * blurred
         S0 += w
-        S1 += wx
-        S2 += wx2
-        S3 += wx2 * x
-        S4 += wx2 * x * x
+        S1 += wb
+        S2 += wb2
+        S3 += wb2 * blurred
+        S4 += wb2 * blurred * blurred
         T0 += w * corr
-        T1 += wx * corr
-        T2 += wx2 * corr
-
-        has_w = w > 0
-        min_x = torch.where(has_w, torch.minimum(min_x, x), min_x)
-        max_x = torch.where(has_w, torch.maximum(max_x, x), max_x)
+        T1 += wb * corr
+        T2 += wb2 * corr
 
         frame_report.append({
             "t": float(t),
-            "n_overburn": int(overburn.sum().item()),
+            "n_frames": len(idxs),
+            "n_overburn": n_overburn_total,
             "mean_weight": float(w.mean().item()),
         })
 
-    # Per-pixel weighted OLS for corr = a + b*x + c*x^2: a batched 3x3 closed-form solve, one
-    # (symmetric) moment matrix and rhs vector per pixel -- same streamed-sums idea darkcal.py
-    # uses for bias + rate*t, generalized to 3 parameters and a per-pixel x. Runs as one
-    # batched torch.linalg solve over all H*W pixels at once.
+    # Per-pixel weighted OLS for corr = a + b*blurred + c*blurred^2: a batched 3x3 closed-form
+    # solve, one (symmetric) moment matrix and rhs vector per pixel -- same streamed-sums idea
+    # darkcal.py uses for bias + rate*t, generalized to 3 parameters and a per-pixel regressor.
+    # Runs as one batched torch.linalg solve over all H*W pixels at once.
     H, W_ = S0.shape
     M = torch.empty((H, W_, 3, 3), dtype=torch.float64, device=device)
     M[..., 0, 0] = S0; M[..., 0, 1] = S1; M[..., 0, 2] = S2
@@ -356,7 +570,7 @@ def fit_flat_model_from_stack(
     ).reshape(H, W_, 3)
     a_fit, b_fit, c_fit = coeffs[..., 0], coeffs[..., 1], coeffs[..., 2]
 
-    reliable = nonsingular & ((max_x - min_x) > min_reliable_range)
+    reliable = nonsingular
     zero = a_fit.new_zeros(())
     a = torch.where(reliable, a_fit, zero)
     b = torch.where(reliable, b_fit, zero)
@@ -384,7 +598,7 @@ def _flat_files(flat_dir) -> list:
 
 def fit_flat_model(flat_dir, dark_model=None, device: torch.device | None = None) -> FlatModel:
     """Decode every flat NEF in `flat_dir` and fit the per-pixel brightness-dependent flat
-    model, streaming frame by frame."""
+    model, averaged within each distinct exposure time."""
     from eclipse_v7.inputs import _decode_nef_linear
     from eclipse_v7.stage0 import get_info_from_exif
 
@@ -401,7 +615,7 @@ def fit_flat_model(flat_dir, dark_model=None, device: torch.device | None = None
         times, _decoded_frames(), dark_model=dark_model, device=device)
     return FlatModel(
         a=a, b=b, c=c, reliable=reliable, exposures=used_exposures, n_frames=n_frames,
-        frame_report=frame_report,
+        value_threshold=FLAT_MODEL_VALUE_THRESHOLD, frame_report=frame_report,
     )
 
 
@@ -413,29 +627,32 @@ def print_report(model: FlatModel) -> None:
           f"{len(model.exposures)} distinct exposure time(s) "
           f"({model.exposures.min():.6f} .. {model.exposures.max():.6f} s)")
 
-    by_t: dict[float, list] = {}
-    for r in model.frame_report:
-        by_t.setdefault(round(r["t"], 9), []).append(r)
     print(f"{'exposure (s)':>14} {'frames':>7} {'mean weight':>13}")
-    for t in sorted(by_t):
-        rows = by_t[t]
-        mean_w = float(np.mean([r["mean_weight"] for r in rows]))
-        print(f"{t:>14.6f} {len(rows):>7d} {mean_w:>13.3%}")
+    for r in sorted(model.frame_report, key=lambda r: r["t"]):
+        print(f"{r['t']:>14.6f} {r['n_frames']:>7d} {r['mean_weight']:>13.3%}")
 
     frac_reliable = float(model.reliable.mean())
-    print(f"flatcal: {frac_reliable:.3%} of pixels have a reliable fit (dynamic range > "
-          f"{MIN_RELIABLE_RANGE}); the rest fall back to no correction (a=b=c=0)")
+    print(f"flatcal: {frac_reliable:.3%} of pixels have a reliable fit (nonsingular 3x3 solve, "
+          f">=3 exposure groups with distinct blurred values below value_threshold); the rest "
+          f"fall back to no correction (a=b=c=0)")
+    print(f"flatcal: value_threshold = {model.value_threshold:.5f} -- data at/above this never "
+          f"entered the fit; apply_masked fades the correction out over "
+          f"[{FLAT_MODEL_THRESHOLD_MARGIN_FRAC * model.value_threshold:.5f}, "
+          f"{model.value_threshold:.5f}] and never applies it at/above the threshold itself, "
+          f"regardless of `reliable`")
 
     a, b, c = model.a, model.b, model.c
     print(f"flatcal: intercept  (a) mean {a.mean():+.5f}, min {a.min():+.5f}, max {a.max():+.5f}")
     print(f"flatcal: linear     (b) mean {b.mean():+.5f}, min {b.min():+.5f}, max {b.max():+.5f}")
     print(f"flatcal: quadratic  (c) mean {c.mean():+.5f}, min {c.min():+.5f}, max {c.max():+.5f}")
 
-    for v, label in ((0.0, "dim"), (1.0, "bright")):
-        corr = model.evaluate(np.full_like(a, v, dtype=np.float64))
+    # "bright" probes just below value_threshold, not 1.0 -- apply_masked never lets the fit
+    # touch anything at or above it, so clamp stats there would describe a case that can't occur.
+    for v, label in ((0.0, "dim"), (0.999 * model.value_threshold, "near threshold")):
+        corr = model.evaluate_refined(np.full_like(a, v, dtype=np.float64))
         n_lo = int(np.sum(corr <= -FLAT_CORR_CLAMP + 1e-6))
         n_hi = int(np.sum(corr >= FLAT_CORR_CLAMP - 1e-6))
-        print(f"flatcal: at value={v:.2f} ({label}): "
+        print(f"flatcal: at value={v:.5f} ({label}): "
               f"{n_lo:,} pixel(s) clamped low, {n_hi:,} clamped high "
               f"({(n_lo + n_hi) / corr.size:.3%})")
 
