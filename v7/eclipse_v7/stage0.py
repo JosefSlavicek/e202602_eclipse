@@ -353,25 +353,38 @@ def subsample_exposure_groups(exposure_groups: dict, factor: int) -> dict:
 
 
 def prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
-    """Drop moons that disagree with rolling reference radius (in-place)."""
+    """Drop moons that disagree with rolling reference radius (in-place).
+
+    The rolling reference starts seeded, not empty: scanning exposure times ascending, the
+    first group whose own radii already agree with each other (std <= RADIUS_STD_THRESHOLD)
+    supplies the initial `prev_avg_radius`. The shortest exposure is often the noisiest for
+    moon-radius detection and may not qualify itself -- seeding from the first group that does
+    means the main loop below (unchanged) can prune that noisy group against a real reference
+    like any other outlier group, instead of having no reference at all to prune it against.
+    """
     def radius(ii):
         return ii.moon[2]
 
+    sorted_times = sorted(exposure_groups.keys())
+
     prev_avg_radius = None
-    for exposure_time in sorted(exposure_groups.keys()):
+    for exposure_time in sorted_times:
+        radii = [radius(ii) for ii in exposure_groups[exposure_time]]
+        if np.std(radii) <= RADIUS_STD_THRESHOLD:
+            prev_avg_radius = float(np.mean(radii))
+            break
+    assert prev_avg_radius is not None, "no exposure group has a self-consistent moon radius"
+
+    for exposure_time in sorted_times:
         group = list(exposure_groups[exposure_time])
         assert len(group) >= MIN_GROUP_ELMS
         radii = [radius(ii) for ii in group]
         mean_r = np.mean(radii)
         std_r = np.std(radii)
-        mean_r_ok = (
-            prev_avg_radius is None
-            or abs(mean_r - prev_avg_radius) <= 0.1 * prev_avg_radius
-        )
+        mean_r_ok = abs(mean_r - prev_avg_radius) <= 0.1 * prev_avg_radius
         if std_r <= RADIUS_STD_THRESHOLD and mean_r_ok:
             prev_avg_radius = mean_r
         else:
-            assert prev_avg_radius is not None
             subgroup = [
                 ii
                 for ii in group
