@@ -406,7 +406,14 @@ def prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
 
 
 def interpolate_missing_moons(image_infos: list, exposure_groups: dict) -> tuple:
-    """Linear fit moon (i,j) vs time for direct detections; fill missing + radii (in-place)."""
+    """Linear fit moon (i,j) vs time for direct detections; fill missing + radii (in-place).
+
+    The rolling reference radius starts seeded, not empty: scanning exposure times ascending,
+    the first group with any surviving direct detection supplies the initial `last_avg_radius`.
+    An early, noisy exposure can lose every one of its detections to pruning (see
+    `prune_moon_info_for_radius_outliers`), leaving nothing for the main loop below (unchanged)
+    to fall back on for it without this seed.
+    """
     pts_with_moon = [
         (ii.timestamp, ii.moon[0], ii.moon[1])
         for ii in image_infos
@@ -422,15 +429,23 @@ def interpolate_missing_moons(image_infos: list, exposure_groups: dict) -> tuple
     def interpolate_moon_at_time(t: float):
         return (float(a_i * t + b_i), float(a_j * t + b_j))
 
+    sorted_times = sorted(exposure_groups.keys())
+
     last_avg_radius = None
-    for exposure_time in sorted(exposure_groups.keys()):
+    for exposure_time in sorted_times:
+        with_moon = [ii for ii in exposure_groups[exposure_time] if ii.moon is not None]
+        if with_moon:
+            last_avg_radius = float(np.mean([ii.moon[2] for ii in with_moon]))
+            break
+    assert last_avg_radius is not None, "no exposure group has any surviving moon detection"
+
+    for exposure_time in sorted_times:
         group = exposure_groups[exposure_time]
         with_moon = [ii for ii in group if ii.moon is not None]
         if with_moon:
             avg_radius = float(np.mean([ii.moon[2] for ii in with_moon]))
             last_avg_radius = avg_radius
         else:
-            assert last_avg_radius is not None
             avg_radius = last_avg_radius
         for ii in group:
             if ii.moon is None:
