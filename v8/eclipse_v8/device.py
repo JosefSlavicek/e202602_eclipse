@@ -10,8 +10,8 @@ def configure_cuda_visible_devices() -> None:
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     # Which physical GPU: override with CUDA_VISIBLE_DEVICES in the shell if needed.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
-    # Required by torch.use_deterministic_algorithms(True) for deterministic cuBLAS; must be
-    # set before CUDA initializes, so alongside CUDA_VISIBLE_DEVICES rather than in seed_everything.
+    # seed_everything() needs this for reproducible GPU math, but it has to be set before
+    # CUDA starts up, so it lives here instead of there.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
@@ -25,13 +25,11 @@ def require_cuda() -> None:
 
 
 def seed_everything(seed: int) -> None:
-    """Seed every RNG the pipeline draws from and force deterministic GPU kernels.
+    """Make a run reproducible: same seed, same output every time.
 
-    Covers stage0's moon-edge triplet sampling and stage1's debug-frame pick (both draw
-    from the global `random` module, unseeded otherwise) and stage1's Adam pose fit, whose
-    backward pass through indexed gather/scatter is only bitwise-reproducible under
-    use_deterministic_algorithms. Call after configure_cuda_visible_devices() (which sets
-    CUBLAS_WORKSPACE_CONFIG) and before any stage runs.
+    Fixes the random draws in stage0 and stage1 (moon-edge sampling, a debug-frame pick),
+    and turns on PyTorch's deterministic mode so stage1's GPU optimizer gives identical
+    numbers too. Call after configure_cuda_visible_devices(), before any stage runs.
     """
     import random
 

@@ -1,10 +1,9 @@
 """Reference-grid warping and the cross-exposure transform chain.
 
-Lifted out of `stage3.warp_merge_to_composite` because three callers now need it: the
-legacy merge, the radiometric merge (`merge.py`) and the response-curve calibration
-(`calib.py`).  Keeping one copy matters more than it looks — the chain composition order
-and the sign convention of `rotation_deg` are the only thing tying an exposure's pixels
-to the reference exposure's pixels, and two divergent copies would silently disagree.
+Shared by the merge (`merge.py`) and the response-curve calibration (`calib.py`), so
+there's only one copy of the chain composition order and the sign convention of
+`rotation_deg` -- the only thing tying an exposure's pixels to the reference exposure's
+pixels. Two divergent copies would silently disagree.
 """
 from __future__ import annotations
 

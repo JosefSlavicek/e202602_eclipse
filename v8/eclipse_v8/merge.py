@@ -1,37 +1,33 @@
-"""Combine the bracket in physical brightness, weighted by a per-frame raw-intensity window.
+"""Combine the bracket into one physical-brightness image, weighted by measurement confidence.
 
-Replaces `stage3.warp_merge_to_composite`, which rescaled *encoded* values down a chain of
-fitted per-pair exponents and averaged them under a hand-shaped bell weight on the *stored*
-value. Here every exposure is converted to brightness independently through the shutter-time
-correction (`source.load_radiance`), and each frame's own merge weight is measured once, at
-ingestion, directly from its unmodified raw decode (`rawprep.window`, `rawprep.decode_and_measure`)
-— before dark/flat correction, before averaging, before anything else. That per-frame weight
-map is carried through the same warps the image data goes through (this module's intra-
-exposure warp+average, then the cross-exposure chain in `merge_to_composite`), so it never
-needs a `[0, 1/t_eff]`-style clamp of its own: it was never in radiance units to begin with,
-just a window over the raw stored fraction. Long exposures still dominate the faint outer
-corona and short exposures the bright inner corona, because each frame's window is only ever
-full-weight for the brightness range that exposure resolves well — but the weight curve
-itself is a fixed hand-shaped window, not fitted or derived from a noise model.
+Replaces `stage3.warp_merge_to_composite`, which averaged encoded pixel values scaled by a
+chain of fitted exponents, under a hand-shaped bell weight. Here every exposure is
+converted to real brightness independently (`source.load_radiance`), and each frame's own
+merge weight is measured once, at ingestion, straight off its raw decode -- before
+dark/flat correction, before averaging, before anything else touches it (`rawprep.py`).
+That weight map rides through the same warps as the image data, so it stays pixel-aligned
+with it and needs no clamping of its own -- it was never a brightness value to begin with,
+just a window over how trustworthy the raw reading was. Long exposures still dominate the
+faint outer corona and short exposures the bright inner corona, because each frame's
+window is only full-weight where that exposure reads the scene well.
 
-The (now group-averaged) weight is then scaled by `t_eff * len(group)` — total integration
-time of the group — before summing across exposures. At a given pixel every exposure group is
-estimating the same true radiance, so under a shot-noise-dominated model
-(`Var(Lbar) ~ L / (t_eff * n)`, `L` common to all groups at that pixel) this makes `w` track
-inverse-variance more closely than the window shape alone. It is still an approximation, not a
-fitted noise model: read noise and systematic calibration error, which dominate at the
-short-exposure end, do not scale this way.
+We then scale each group's weight by its total integration time (`t_eff * frame count`)
+before summing across exposures. Since every exposure is estimating the same true
+brightness at a given pixel, and shot noise scales roughly as brightness / integration
+time, this makes the weight track the *inverse-variance* more closely than the raw window
+shape alone would. It's still an approximation, not a fitted noise model: things like
+read noise don't scale this way.
 
-Two things are deliberately kept from v2:
+Two things kept from v2:
 
-  * **Common moon blanking.** The detected moon radius drifts 5.94 px across the bracket
+  * Common moon blanking. The detected moon radius drifts 5.94 px across the bracket
     (316.03 px at 1/4000 s down to 310.19 px at 2 s) because glare in long exposures makes
-    the edge-finder place the limb further in. Every exposure is blanked to the union of the
-    disks — v2 achieved this by multiplying everything by the shortest exposure's mask.
-    Without it, the annulus between the smallest and largest disk is populated only by
-    saturated long exposures.
-  * **One exposure at a time.** 15 exposures x 2 arrays at 4000x6000 float32 is ~2.9 GB on
-    the GPU. Build, warp, accumulate, free.
+    the edge-finder place the limb further out. So every exposure is blanked to the union
+    of all the moon disks -- otherwise the ring between the smallest and largest disk
+    would be populated only by saturated long exposures.
+  * One exposure at a time. All the exposures at once would be ~2.9 GB of GPU memory (15
+    exposures x 2 full-res arrays); instead we build, warp, accumulate, and free each one
+    before moving to the next.
 """
 from __future__ import annotations
 
@@ -62,28 +58,19 @@ def _moon_out_mask(ii, H, W, device):
 
 
 def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
-    """Stack one exposure group in brightness. Returns (Lbar, covered, moon_out, group_weight).
+    """Stack one exposure group in physical brightness. Returns (Lbar, covered, moon_out, group_weight).
 
-    Converting each frame and then averaging the brightnesses — rather than averaging the
-    stored values and converting once, as v2 did — matters because `f` is curved: the
-    average of encoded values is not the encoding of the average.
+    We convert each frame to brightness first and average those, rather than averaging the
+    raw stored values and converting once -- the two aren't the same, since the response
+    curve isn't a straight line.
 
-        Lbar = sum(m*L) / sum(m)
-
-    where `m` is `~source.load_overburn` (masked out inside this frame's own moon disk):
-    every reading a frame actually has is trusted equally, not tapered by how close its
-    stored value sits to the clip range — so `Lbar` is a plain mean over the frames that
-    cover a pixel at all. `covered = sum(m)/n` reuses that same mask, so it answers exactly
-    "what fraction of frames covered this pixel", with nothing else folded in.
-
-    `group_weight` is this group's merge weight, by the same masked-mean pattern:
-    `sum(m*weight) / sum(m)`, where each frame's `weight` is `source.load_weight` — measured
-    once from the unmodified raw at ingestion (rawprep.py), warped here by this same frame's
-    intra-exposure pose. This is *not* derived from Lbar; it just rides along through the
-    same warp so weight and data stay pixel-aligned.
-
-    `moon_out` is returned separately from `covered` because `covered` also excludes
-    unusable (saturated) pixels, and the merge needs the moon geometry on its own.
+    `Lbar` is a plain mean over the frames that actually cover a pixel (not saturated, not
+    on the moon); `covered` is what fraction of the group's frames did. `group_weight` is
+    the group's merge weight, averaged the same way -- it comes from `rawprep.py`'s
+    per-frame measurement, not from `Lbar` itself, and just rides along through the same
+    warp so it stays pixel-aligned with the data. `moon_out` is kept separate from
+    `covered` since the merge needs the moon's shape on its own, not lumped in with
+    saturation.
     """
     n = len(group)
     assert n >= 1, group
@@ -123,16 +110,14 @@ def average_exposure_radiance(group, abs_xy, abs_angle_t, source, device):
 
 
 def merge_to_composite(ctx, source) -> None:
-    """Window-weighted merge of every exposure onto the reference grid.
+    """Merge every exposure onto the reference grid, weighted by confidence.
 
-    Sets `ctx.composite` (brightness, `NO_DATA` where nothing could see the pixel),
-    `ctx.composite_variance` (`1/sum(w)`, `inf` at `NO_DATA` — a nominal effective-variance
-    proxy under the window weights below, not a physically derived uncertainty), `ctx.valid_all`
-    (mutual geometric coverage, as v2), `ctx.no_data_mask`, and `ctx.exposure_weights` /
-    `ctx.exposure_weight_times` — every individual exposure's own weight map in ref coords,
-    before summing, for later inspection of which exposure dominated where. That stack is
-    one full-resolution array per exposure (tens of exposures), so it is the single largest
-    thing this function computes; nothing here needs it, it exists purely to be saved.
+    Sets `ctx.composite` (brightness, `NO_DATA` where nothing could see the pixel) and
+    `ctx.composite_variance` (`1/sum(w)`, a rough effective-variance estimate, not a truly
+    measured one). Also saves each exposure's own weight map before summing
+    (`ctx.exposure_weights`/`ctx.exposure_weight_times`), purely so it can be inspected
+    later -- nothing downstream needs it, and it's the single largest thing this function
+    computes.
     """
     device = ctx.device
     available = {

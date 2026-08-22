@@ -1,42 +1,26 @@
 """Per-pixel dark-current model: bias + rate against the camera's reported exposure time.
 
 The darks/ bracket is shot at the same exposure times as the lights, several frames each.
-Rather than average each exposure time's darks in isolation (matched-exposure subtraction,
-noise reduced by 1/sqrt(frames-per-time)) this fits one affine model per pixel
+Instead of averaging each exposure time's darks on its own, we fit one line per pixel,
+`dark(t) = bias + rate * t`, using every dark frame at once. Pooling across all exposure
+times gives a much lower-noise estimate than any single exposure time's few frames could
+-- as long as the sensor stayed at a stable temperature while the darks were shot.
 
-    dark(t) = bias + rate * t
+We deliberately don't correct the camera's reported shutter time here. It's known to be a
+bit off, especially at short exposures, but we always subtract `bias + rate * t` from a
+frame reporting that same `t` -- so whatever the reported time's error is, it's the same
+error on both the dark and the light frame, and it cancels out of the subtraction. (The
+true exposure time does matter later, for converting a light frame into physical
+brightness -- that's `calib.py`'s job, not this one's.)
 
-by ordinary least squares over *every* dark frame at once, `t` the plain EXIF-reported
-exposure time. Pooling across all exposure times gives a much lower-noise estimate than
-any single exposure time's few frames could supply on their own, at the cost of assuming
-the model holds across the whole dark-shooting session (sensor temperature stable while
-the darks were shot).
+Because there's no shutter correction to fit, this can run before we've looked at the
+light frames at all, and its result should be baked into the rawprep-corrected cache
+before stage 0, so registration and calibration see the same dark-subtracted values the
+final merge does.
 
-**No shutter-time correction is fitted or applied here, on purpose.** The camera's reported
-time is known to be somewhat off, especially at short speeds — but this model is only ever
-*applied* by subtracting `bias + rate * t` from a frame reporting that same `t`, and that
-subtraction is fit and applied with the same EXIF label both times. Whatever the reported
-time's absolute error is, it is the same error on a dark and a light shot at the same
-labelled speed (same camera, same shutter), so it cancels out of the subtraction — this
-model does not need to know the true exposure time to do its job. (True exposure time still
-matters elsewhere, for converting a dark-subtracted light frame into physical brightness —
-that is `calib.py`'s job, downstream of this one.) Trying to fit a per-exposure timing
-correction here instead would trade this cancellation for a fit that is nearly uninformative
-at short exposures (`rate * t` is tiny regardless of the timing error, so there is barely a
-signal to fit the correction to) and risks corrupting the pooled bias/rate through exactly
-those exposures.
-
-Because there is no correction to fit, this can run before anything about the light bracket
-is known, and its result should be baked into the rawprep corrected cache
-(`rawprep.apply_corrections`) before stage 0, so registration and the light calibration's own
-sample-gathering see the same dark-subtracted values the final merge does, not just the merge.
-
-The fit itself needs no iteration: `bias`/`rate` per pixel is one ordinary least-squares
-solve with the same 1-D design matrix (the shared list of `t`) for every pixel, so it
-reduces to accumulating three per-pixel sums (`sum(y)`, `sum(t*y)`, `sum(y^2)`) while
-streaming the frames, then one closed-form 2x2 solve. No GPU needed; decoding the raw files
-is the only real cost, and `fit_dark_model_from_stack` is separable from that, which is what
-lets `test_darkcal_synthetic.py` exercise the numerics without any real files.
+The fit needs no iteration: bias/rate per pixel is one closed-form least-squares solve, so
+it reduces to three running sums per pixel while the frames stream through. No GPU needed
+-- decoding the raw files is the only real cost.
 """
 from __future__ import annotations
 

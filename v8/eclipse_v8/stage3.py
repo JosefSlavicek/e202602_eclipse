@@ -40,18 +40,16 @@ RGB_DIM_QUOTIENTS = (0.25, 0.28, 0.37)
 # than this means the no-data mask holds something that is not the moon.
 MOON_GROW_MAX_PX = 16.0
 
-# The composite is physical brightness now, while every constant downstream
-# (`_radial_tone_map` breakpoints, `_percentile_stretch`, UNSHARP_WEIGHTS, RGB_DIM_QUOTIENTS)
-# was tuned against v2's encoded composite. This is the one knob provided instead of
-# retuning all of them; everything downstream works on ratios to a local mean or per-radius
-# quantiles, so the normalisation is cosmetic and only the exponent matters.
+# The composite is physical brightness now, but every constant downstream was tuned
+# against v2's encoded (JPEG-scaled) composite. Rather than retune all of them, we
+# normalize brightness once here by this one exponent; everything downstream works on
+# ratios to a local mean or per-radius quantiles, so only the exponent matters.
 #
-# For the JPEG data the correct value is 1.0 — no compression. Do NOT derive it from first
-# principles ("v2's composite was JPEG-compressed, so imitate that" gives ~1.63 and ruins the
-# image): v2 scaled exposures by (t_ref/t_k)^(1/g) with g ~ 1.1, which is nearly the plain
-# exposure ratio, so its composite was already nearly proportional to brightness. Measured
-# spread (p99/p50) was 167 for v2 against 233 uncompressed, i.e. an exponent of 1.065.
-# `report_display_exponent.py` re-measures it.
+# The correct value on the JPEG data is 1.0 -- no correction needed. It's tempting to
+# derive a different number from "v2's composite was JPEG-compressed, so imitate that",
+# but that reasoning is wrong and gives ~1.63, which ruins the image: v2's own exposure
+# scaling already made its composite nearly proportional to brightness, so there's
+# nothing left here to correct for.
 DISPLAY_GAMMA = 1.0
 DISPLAY_NORM_PERCENTILE = 99.9
 
@@ -581,12 +579,11 @@ def crop_and_save_composite(ctx: Stage3Context) -> None:
         saved.append(out_dir / "v8-stage3_weights.npy")
         saved.append(out_dir / "v8-stage3_weights_exposures.npy")
 
-    # Hand-off to the display chain. Everything downstream — find_moon, the polar
-    # extrapolation, the p3 stretch, and the limb-protection machinery in the FFT unsharp —
-    # was written against v2's composite, which held 0.0 inside the moon because every
-    # exposure was multiplied by `mask_0`. The radiometric merge writes NO_DATA (-1.0) there
-    # instead, so fill it back to 0.0 before anything reads percentiles or hunts for the
-    # disk; leaving a negative sentinel in would skew every quantile and confuse `find_moon`.
+    # Hand off to the display chain. Everything downstream (find_moon, polar extrapolation,
+    # the stretch, FFT-unsharp's limb protection) expects 0.0 inside the moon, the way
+    # v2's composite always had it. This merge writes NO_DATA (-1.0) there instead, so we
+    # fill that back to 0.0 first -- a stray negative sentinel would skew every quantile
+    # and confuse find_moon.
     composite_crop = fill_no_data(radiance_crop, ctx.no_data_crop)
     composite_crop = composite_for_display(composite_crop, no_data=ctx.no_data_crop)
 
@@ -660,23 +657,20 @@ def _polar_transform_and_extrapolate(img, center, radius_min, radius_max, n_r, n
 def _grow_moon_over_no_data(dist_sq, no_data, moon_r_fitted):
     """Grow the fitted moon circle until it covers every blanked pixel. Returns the radius.
 
-    `find_moon` fits a circle to the boundary of the region the merge blanked, but that region
-    is a pixel map, not a circle: the union of ~15 per-frame disks whose centres differ by
-    registration residuals and whose radii span 5.94 px, bilinear-resampled into reference
-    coordinates and thresholded. Parts of it stick out past the fitted circle.
+    `find_moon` fits a circle to the blanked region's boundary, but that region isn't
+    actually a circle -- it's the union of ~15 per-frame disks with slightly different
+    centers and radii, resampled onto the reference grid. Some of it sticks out past the
+    fitted circle.
 
-    Everything downstream models the black area as exactly `dist^2 <= moon_r^2` — the FFT limb
-    protection builds its indicator from the complement of that predicate, the anisotropic blur
-    drops source radii below `moon_r`, and the final blackening uses the disk itself. A pixel
-    that is blank but outside the circle is therefore an unmodelled step edge in the one place
-    the protection exists to guard, and its zeros leak into the blur. Growing the radius to
-    cover them (and blanking the annulus this gains, in `radial_normalize_display`) makes the
-    three agree on one pixel set.
+    Everything downstream (the FFT limb protection, the blur, the final blackening)
+    assumes the black area is exactly this circle. A blanked pixel outside it would be an
+    unmodeled edge right where that protection is supposed to help, so we grow the radius
+    to cover it instead.
 
-    Assumes the blanked region is the moon disk alone. It can also hold pixels no exposure
-    could measure for other reasons — every exposure saturated or masked — and a single one of
-    those elsewhere in the frame would inflate the radius without bound, so the growth is
-    capped and exceeding the cap is fatal rather than silently clamped.
+    We assume the blanked region is only the moon. It can also include pixels no exposure
+    could measure for other reasons (all saturated, say), and one such pixel elsewhere in
+    the frame would inflate the radius without limit -- so growth is capped, and going
+    over that cap fails loudly instead of being silently clamped.
     """
     if no_data is None or not no_data.any():
         return float(moon_r_fitted)
@@ -798,12 +792,11 @@ def _percentile_stretch(display_t, valid, center, radius_min, radius_max, n_r, n
 
 
 def radial_normalize_display(ctx: Stage3Context) -> None:
-    """Refine and grow moon; polar radial tone + p3 stretch → ctx.display (grayscale [0,1], moon blanked).
+    """Refine and grow the moon; polar radial tone + p3 stretch -> ctx.display (grayscale [0,1], moon blanked).
 
-    The growth (`_grow_moon_over_no_data`) affects nothing in the normalisation itself — the
-    polar pole is the moon *centre*, `radius_min` is 0, and the extrapolation keys off validity
-    rather than radius, so `moon_r` is read here only to build `ctx.moon_mask`. It matters to
-    the sharpener, which is why the disk is blanked in `ctx.display` on the way out.
+    The growth (`_grow_moon_over_no_data`) doesn't affect the normalization itself -- it's
+    only used here to build `ctx.moon_mask`. It matters to the sharpener, which is why the
+    disk gets blanked in `ctx.display` on the way out.
     """
     assert ctx.composite_crop is not None
     device = ctx.device

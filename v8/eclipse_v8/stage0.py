@@ -317,18 +317,11 @@ def group_by_exposure(image_infos: list) -> dict:
 
 
 def subsample_exposure_groups(exposure_groups: dict, factor: int) -> dict:
-    """Keep ~1/`factor` of the exposure groups, evenly spaced across the exposure range.
+    """Keep ~1/`factor` of the exposure groups, spread evenly, for faster iteration.
 
-    `factor` is a positive integer (1 = keep every group). For factor > 1 roughly
-    (factor-1)/factor of the groups are dropped to speed up smoke / iteration runs
-    (factor=2 -> ~half, factor=3 -> ~a third, ...). The shortest and longest exposures
-    are always preserved so the full dynamic range is still spanned, and the survivors
-    are picked evenly in exposure-sorted order. Whole groups are dropped (never individual
-    frames), so downstream per-group invariants (MIN_GROUP_ELMS, pruning) are untouched.
-
-    NOTE: dropping middle groups widens the log-exposure gap between surviving neighbours,
-    which degrades the stage2 cross-exposure brightness/gamma fit. This is a runtime knob
-    for faster iteration, not a "same result, faster" switch.
+    Always keeps the shortest and longest exposure, and drops whole groups, never
+    individual frames. Not a "same result, faster" switch: fewer groups means bigger
+    gaps between neighbors, which hurts stage 2's cross-exposure fit.
     """
     if not isinstance(factor, int) or factor < 1:
         raise ValueError(f"exposure-group subsample factor must be an int >= 1, got {factor!r}")
@@ -347,14 +340,12 @@ def subsample_exposure_groups(exposure_groups: dict, factor: int) -> dict:
 
 
 def prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
-    """Drop moons that disagree with rolling reference radius (in-place).
+    """Drop moons whose radius disagrees with a rolling reference (in-place).
 
-    The rolling reference starts seeded, not empty: scanning exposure times ascending, the
-    first group whose own radii already agree with each other (std <= RADIUS_STD_THRESHOLD)
-    supplies the initial `prev_avg_radius`. The shortest exposure is often the noisiest for
-    moon-radius detection and may not qualify itself -- seeding from the first group that does
-    means the main loop below (unchanged) can prune that noisy group against a real reference
-    like any other outlier group, instead of having no reference at all to prune it against.
+    We seed the reference from the first exposure group whose own radii already agree with
+    each other, not from nothing. The shortest exposures are often too noisy to seed it
+    themselves, and starting from nothing would leave them with no reference to be pruned
+    against at all.
     """
     def radius(ii):
         return ii.moon[2]
@@ -402,11 +393,9 @@ def prune_moon_info_for_radius_outliers(exposure_groups: dict) -> None:
 def interpolate_missing_moons(image_infos: list, exposure_groups: dict) -> tuple:
     """Linear fit moon (i,j) vs time for direct detections; fill missing + radii (in-place).
 
-    The rolling reference radius starts seeded, not empty: scanning exposure times ascending,
-    the first group with any surviving direct detection supplies the initial `last_avg_radius`.
-    An early, noisy exposure can lose every one of its detections to pruning (see
-    `prune_moon_info_for_radius_outliers`), leaving nothing for the main loop below (unchanged)
-    to fall back on for it without this seed.
+    We seed the reference radius from the first exposure group that still has a surviving
+    detection, since pruning (see prune_moon_info_for_radius_outliers) can wipe out an
+    early, noisy exposure entirely and leave nothing to fall back on otherwise.
     """
     pts_with_moon = [
         (ii.timestamp, ii.moon[0], ii.moon[1])
@@ -614,11 +603,11 @@ def _initial_subset_indices(timestamps, k) -> list:
 
 
 def _select_consistent_subset(group, cleans, pair_cache, device, lever_px) -> list:
-    """Greedily find MAX_IMG group indices whose pairwise registration is self-consistent
-    to <= SUBSET_THRESHOLD_PX. Start from a time-spread subset; while it fails the gate,
-    drop the worst-scoring image and pull in the untried image closest in time to it. An
-    image is only ever pulled in once, so this terminates after at most (n - MAX_IMG) swaps;
-    if nothing passes, the smallest-discrepancy subset seen is returned."""
+    """Pick MAX_IMG images from the group whose pairwise alignment is mutually consistent.
+
+    Starts from a time-spread subset, then repeatedly drops the worst-scoring image and
+    pulls in the closest untried one in time, until the subset passes or every image has
+    been tried. Falls back to the best subset seen if none passes."""
     n = len(group)
     timestamps = [ii.timestamp for ii in group]
     subset = _initial_subset_indices(timestamps, MAX_IMG)
@@ -645,20 +634,18 @@ def _select_consistent_subset(group, cleans, pair_cache, device, lever_px) -> li
 
 
 def register_intra_exposure_pairs(exposure_groups: dict) -> dict:
-    """For each exposure, all ordered pairs: two-stage Fourier-style registration on GPU.
+    """Align every ordered pair of images within each exposure, on GPU.
 
-    Stage 1 (always): per-image polar+FFT cleanup is hoisted out of the per-pair grid search
-    (Fix 3 in v1/perf_analysis_register_intra_exposure_pairs.md). Each image is loaded and
-    cleaned once per group; the grid search then compares pre-cleaned cartesian tensors.
+    Each image is loaded and cleaned up (polar + FFT) once per group, then reused across
+    all its pairs instead of redone for every pair -- that's most of the cost, so this is
+    what makes it fast enough to run.
 
-    Subset capping: groups larger than MAX_IMG are reduced to a self-consistent MAX_IMG-subset
-    (_select_consistent_subset) before the reg dict is written; exposure_groups is mutated in
-    place to the kept frames so downstream sees a clean MAX_IMG-image group reindexed 0..k-1.
+    Groups bigger than MAX_IMG are first cut down to a self-consistent subset of that size
+    (see _select_consistent_subset); only those images get registered.
 
-    Stage 2 (gated by ENABLE_STAGE_2): per-pair narrow-bracket finetune around Stage 1's
-    result, using a common polar center C midway between the two moons. Cleanup re-runs
-    per candidate around C; the moon-limb feature lands at near-identical (r, theta) in
-    both images so it cancels in the L1 diff. Applied only to the final kept pairs.
+    If ENABLE_STAGE_2 is on, each pair then gets a second, narrower search, centered
+    between the two images' moons. The moon's edge lines up almost exactly there, so it
+    cancels out of the alignment score instead of throwing it off.
     """
     device = torch.device("cuda")
     reg = {}

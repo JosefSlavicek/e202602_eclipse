@@ -1,24 +1,22 @@
 """Input source for the v8 pipeline: real NEF raw only.
 
-The whole pipeline consumes a single 2-D [0,1] luminance per frame. So the source is fully
-described by:
-  - how to enumerate frames and read their (exposure, timestamp, size, brightness);
-  - how to load one frame as a float32 [0,1] grayscale tensor.
+The whole pipeline works from a single 2-D [0,1] luminance per frame, so a source just
+needs to know how to enumerate frames (with their exposure, timestamp, size, brightness)
+and how to load one frame as a float32 [0,1] grayscale tensor.
 
-`load_grayscale` (utils) and `detect_moons`/`get_image_infos` (stage0) route through the
-active source via `ImageInfo.source`, which is re-attached after every pickle load
-(`attach_source`) and never pickled itself.
+`load_grayscale` (utils) and `detect_moons`/`get_image_infos` (stage0) go through the
+active source via `ImageInfo.source`, which gets re-attached after every pickle load
+(`attach_source`) since it's never pickled itself.
 
-**Two contracts, not one.**  `load_gray` returns the *stored* value — what stage0/1/2
-register on and what the calibration is fitted to. As of the rawprep rework this is the
-dark+flat-corrected value (see `rawprep.apply_corrections`), read straight from that cache —
-`load_gray` no longer decodes or corrects anything itself.  `load_radiance` returns physical
-brightness with its variance, and is the only path radiometry may take.  A source becomes
-able to answer the second one after `set_calibration`.
+There are two different values a source can give you. `load_gray` returns the *stored*
+value -- what registration works on and what the calibration is fitted to; since the
+rawprep rework this is the dark+flat-corrected value, read straight from that cache.
+`load_radiance` returns real physical brightness with its variance, and only works after
+`set_calibration` has been called.
 
-Overburn and the merge's per-frame weight are *not* derived here at all: they are computed
-once, per raw frame, straight off the unmodified decode, in `rawprep.py` — before dark/flat
-correction ever runs — and just read back by `load_overburn`/`load_weight`.
+Overburn and the merge's per-frame weight aren't computed here at all -- they're measured
+once, straight off the unmodified raw decode, in `rawprep.py`, and just read back by
+`load_overburn`/`load_weight`.
 """
 from __future__ import annotations
 
@@ -174,16 +172,13 @@ class NefSource:
         return float(ii.exposure_time) * self.exposure_correction(ii)
 
     def load_radiance(self, ii, device):
-        """(radiance, variance, usable) as float32 (H, W) tensors: physical brightness per
-        pixel.
+        """(radiance, variance, usable): physical brightness per pixel, as float32 (H, W) tensors.
 
-        `radiance` is light per unit time — a property of the sky, identical in every frame.
-        `variance` is that estimate's own uncertainty squared, modelled as
-        `signal/gain + read_noise^2`, giving the familiar 1/sqrt(t) improvement. `usable` is
-        the per-frame overburn mask, inverted — every frame that clears it is trusted
-        equally in the exposure-group average.
-
-        `signal` (via load_gray) is already dark-subtracted and flat-divided.
+        `radiance` is light per unit time -- the same physical quantity in every frame.
+        `variance` is that estimate's own uncertainty, modeled as `signal/gain +
+        read_noise^2`, which gives the usual "longer exposure, less noise" improvement.
+        `usable` is the per-frame overburn mask, inverted -- every frame that isn't
+        saturated there counts equally in the exposure-group average.
         """
         signal = self.load_gray(ii, device)
         t_eff = self.effective_exposure(ii)

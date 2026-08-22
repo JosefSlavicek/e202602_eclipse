@@ -1,27 +1,25 @@
-"""Per-frame overburn mask + merge-intensity window, measured once from unmodified raw.
+"""Per-frame overburn mask + merge weight, measured once from the unmodified raw.
 
-Computed at ingestion — before dark subtraction, before flat-field division, before anything
-else touches the frame — directly from the decoded raw counts. Saturation is a property of
-the physical sensor's raw ADC reading; deciding it here, rather than after dark/flat
-correction, means the answer can't be nudged across the threshold by those later corrections.
+We compute these at ingestion -- before dark subtraction, before flat-field correction,
+before anything else touches the frame -- straight from the decoded raw counts.
+Saturation is a property of the sensor's raw reading, so deciding it here means a later
+correction can't nudge a pixel across the threshold.
 
 Two products per light frame, cached to disk and never recomputed downstream:
 
-  overburn  (H, W) bool   — decoded >= RAW_OVERBURN_HI. The only hard exclusion: a saturated
-                            pixel's true value is lost, so it is dropped from the within-
-                            exposure plain average outright, not merely down-weighted.
-  weight    (H, W) float  — a continuous window over the same decoded value (see `window`):
-                            full trust in the middle of the range, tapering to (not below) a
-                            small floor near 0 and RAW_OVERBURN_HI. This — not anything
-                            derived from calibrated radiance — is the merge weight. It is
-                            carried through both the intra-exposure and cross-exposure warps
-                            alongside the image data (see merge.average_exposure_radiance),
-                            so it never needs its own [0, 1/t_eff]-style clamp: it was never
-                            in radiance units to begin with.
+  overburn  (H, W) bool   -- decoded >= RAW_OVERBURN_HI. The only hard exclusion: a
+                            saturated pixel's true value is lost, so we drop it from the
+                            within-exposure average outright, not just down-weight it.
+  weight    (H, W) float  -- a continuous window over the same decoded value (see
+                            `window`): full trust in the middle of the range, tapering
+                            to a small floor near 0 and RAW_OVERBURN_HI. This is the
+                            merge weight -- not anything derived from calibrated
+                            brightness -- and it rides through every warp alongside the
+                            image data (see merge.average_exposure_radiance).
 
-`run` persists (decoded, overburn, weight) per frame so the decode happens exactly once;
-`apply_corrections` reads the cached `decoded` back to bake in dark/flat correction (producing
-the values load_gray/load_radiance actually read), so the NEF is never decoded twice.
+`run` saves (decoded, overburn, weight) per frame so the raw is decoded exactly once;
+`apply_corrections` reads that cached decode back and bakes in dark/flat correction, so
+the NEF is never decoded a second time.
 """
 from __future__ import annotations
 

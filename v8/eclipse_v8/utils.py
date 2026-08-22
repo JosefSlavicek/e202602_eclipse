@@ -50,9 +50,9 @@ def apply_transform_single(img, shift_i, shift_j, angle_deg, device):
 def compute_weighted_average(group, abs_xy, abs_angle_t, device, epsilon=1e-6, keep_warped=True):
     """Mask (moon blacked out), warp, and average a group of images.
 
-    `keep_warped=False` returns an empty `warped_list`, so peak memory is two full-resolution
-    tensors instead of one per frame in the group — pass it from callers that only want the
-    average (the calibration and the radiometric merge do).
+    `keep_warped=False` skips building `warped_list`, so it doesn't hold one warped frame
+    per image in memory. Pass it when the caller only needs the average, not every frame
+    (the calibration and the merge do).
 
     Returns:
         avg_img      – weighted average image

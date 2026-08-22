@@ -1,24 +1,22 @@
-"""Recover the camera response curve once for the whole bracket (Debevec & Malik).
+"""Recover the camera's response curve for the whole exposure bracket, once.
 
-Replaces v2's per-pair exponent chain.  The model is
+Each exposure sees the same sky at a different brightness, because the shutter was open
+for a different time. To combine them into one physically accurate image we need to know
+how a stored pixel value relates to the actual light that hit the sensor -- that mapping
+is the "response curve", and it's the same curve for every exposure. We solve for it with
+one least-squares fit over a few thousand sample pixels seen across ~15 exposures, together
+with a small correction to each exposure's reported shutter time (the camera doesn't
+report them perfectly).
 
-    ln f(v_ik)  =  ln L_i  +  ln t_k  +  ln c_k
+The trap: if the curve and the shutter corrections are both free at the same time, the fit
+can't tell them apart. Many different combinations explain the data equally well, and the
+solver (`lsqr`) doesn't fail loudly when that happens -- it reports `istop=3` (its code for
+"this is ill-conditioned") but still returns plausible-looking numbers, with the
+corrections wrong by orders of magnitude. So instead of solving for both at once, we
+alternate: fit the curve with the corrections held fixed, then refit the corrections,
+repeat. Each step on its own is well-behaved.
 
-with `f` the (unknown) map from a stored value back to accumulated light, `L_i` the
-brightness of sample pixel `i`, `t_k` the reported shutter time and `c_k` a correction to
-it.  Linear in the unknowns, so a least-squares solve over a few thousand sample pixels
-seen across ~15 exposures recovers `f` at 64 knots plus one `ln L` per pixel.
-
-**`ln c_k` is not an unknown of that solve.**  `ln t_k + ln c_k` appears only as a sum, so
-a free `c_k` makes the reported shutter times carry no information and the curve shape
-trades against the exposure ratios at identical residual (Grossberg & Nayar's
-response/exposure-ratio ambiguity).  `lsqr` does not fail loudly on it — it returns
-`istop=3` and plausible-looking numbers with corrections wrong by >1000%.  The corrections
-are instead refined by alternation (`_refine_step`), each subproblem well-posed.
-
-The whole solve is numpy/scipy only: no torch, no GPU.  Only `gather_samples` needs the
-GPU, and it is separable, which is what lets the synthetic test in
-`v8/test_calib_synthetic.py` exercise the numerics in ~10 s on CPU.
+The whole solve runs on CPU (numpy/scipy); only gathering the samples needs a GPU.
 """
 from __future__ import annotations
 
@@ -121,12 +119,12 @@ class CalibResult:
 #  1a. Gather samples                                                         #
 # --------------------------------------------------------------------------- #
 def _log_radial_sample_points(covered_np, moon_ref, n_bins, per_bin, seed):
-    """Sample pixel coordinates stratified in log radius from the moon centre.
+    """Sample pixel coordinates, spread evenly in log radius from the moon center.
 
-    Log radius, not area: the corona spans ~1e4 in brightness over the frame, so a pixel
-    near the limb is only ever well exposed in the shortest frames and one at the corner
-    only in the longest.  Uniform-over-area sampling piles almost every sample into one
-    part of the response curve and leaves the rest unconstrained.
+    Not spread evenly by area: the corona is far brighter near the sun than at the frame's
+    edge, so a pixel near the moon is only well exposed in the shortest frames, and one at
+    the corner only in the longest. Sampling evenly by area would pile almost every sample
+    into one part of the response curve and leave the rest unconstrained.
     """
     H, W = covered_np.shape
     mi, mj, moon_r = moon_ref
@@ -186,12 +184,11 @@ def gather_samples(
     samples_per_bin: int = SAMPLES_PER_BIN,
     seed: int = SAMPLE_SEED,
 ):
-    """Stored values of the same sky pixels across every exposure.
+    """Read out the same sky pixels' stored values, across every exposure.
 
-    Runs after registration (it needs corresponding pixels), which looks circular because
-    cross-exposure alignment used the fitted per-pair exponents.  It is not: those exponents
-    are used *for alignment only* — Fourier alignment cares about structure, not absolute
-    scale — and stop determining any brightness from here on.
+    Runs after registration, which sounds circular since registration used the fitted
+    per-pair exponents -- but those exponents only ever line the frames up, they never
+    determine brightness, so there's no real circularity.
 
     Returns `(V, valid, exposures, sample_ij)`:
         V         (n_exp, M) float64 stored values, encoded, in [0,1]
@@ -274,16 +271,18 @@ def solve_response(
 ):
     """One least-squares solve for the curve knots and the per-pixel brightnesses.
 
-    `ln_t_eff` is `ln t_k + ln c_k` — a *fixed* offset, never an unknown (see module docstring).
+    `ln_t_eff` (shutter time + correction, in log space) is fixed here, never solved for
+    -- see the module docstring for why.
 
-    Rows, one per usable (pixel, exposure):
+    One row per usable (pixel, exposure) pair:
         w · [ (1-a)·g[z] + a·g[z+1] − lnE_i ]  =  w · ln_t_eff_k
-    plus a second-difference smoothness prior scaled by `s(z) = hat(knot z) + 0.05`, plus one
-    gauge row killing the last global degeneracy (`g += c`, `lnE += c`).
+    plus a smoothness prior between neighboring knots, plus one row that pins down an
+    otherwise-free additive constant (the curve and the brightnesses could both shift by
+    the same amount and fit equally well).
 
-    Grayscale values are the mean of three 8-bit channels, so they do not sit on the
-    256-integer grid — hence the interpolation between bracketing knots rather than a
-    lookup.  Still linear in the unknowns.
+    Grayscale values are the mean of three 8-bit channels, so they don't land exactly on a
+    knot -- hence interpolating between the two bracketing knots (`z`, `z+1`) instead of a
+    direct lookup. Still linear in the unknowns either way.
     """
     V = np.asarray(V, dtype=np.float64)
     valid = np.asarray(valid, dtype=bool)
@@ -377,10 +376,10 @@ def calibrate(
 ) -> CalibResult:
     """Fit the response curve, alternating with the per-exposure shutter corrections.
 
-    Each subproblem is well-posed: the curve solve sees the exposure times as fixed, and the
-    correction step is a plain weighted mean of the leftover discrepancy per exposure — a
-    systematic offset for one exposure *is* its timing error.  `n_exposure_refine=0` is the
-    honest nominal-times baseline.
+    Each step on its own is easy to solve: the curve fit treats the exposure times as
+    given, and the correction step is just the average leftover error per exposure -- a
+    systematic offset for one exposure is exactly its timing error. `n_exposure_refine=0`
+    skips this and just trusts the camera's reported times.
     """
     V = np.asarray(V, dtype=np.float64)
     valid = np.asarray(valid, dtype=bool)

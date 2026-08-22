@@ -1,37 +1,28 @@
-"""Re-register the exposure pairs once the response curve is known.
+"""Redo the cross-exposure registration once the response curve is known.
 
-Stage 2 has to align the bracket before anything is calibrated, so it pre-scales the longer
-frame of each pair by a fitted per-pair exponent and hands the grid search a saturation mask
-derived from that same exponent:
+Stage 2 has to align the bracket before anything is calibrated, so it pre-scales the
+longer frame of each pair by a fitted exponent and builds its saturation mask from that
+same guess. Neither is physical, and the alignment search isn't scale-invariant, so a
+wrong brightness guess biases the alignment too -- in a corona that dims steeply with
+radius, "too bright" and "slightly displaced outward" look alike. Stage 2's exponents were
+always meant as just a bootstrap, good enough to get the calibration going.
 
-    apriori_valid = (img0 * ((t1 / t0) ** (1.0 / gamma)) <= 0.9)      # stage2.py
+This module redoes the same search on calibrated data instead:
 
-Neither is physical, and the L1 residual the search minimises is not scale-invariant, so an
-error in the assumed brightness ratio biases the alignment — in a corona whose brightness
-falls steeply with radius, "too bright" and "slightly displaced radially" are partly
-degenerate. Stage 2's exponents therefore remain what they always were: a bootstrap, good
-enough to let the calibration find corresponding pixels.
+  * Both frames are converted to real brightness (`source.load_radiance`). Brightness is
+    the same physical quantity in both frames, so in log space the exposure difference is
+    just a constant offset, which the registration's usual filtering already removes. No
+    brightness guess is needed at all.
+  * The saturation mask comes from each exposure's own actual coverage, not a guess
+    predicted from the other exposure through a fitted exponent.
 
-This module runs afterwards and redoes the same grid search on calibrated data:
+`refine_cross_registration` returns a new `cross_reg` plus a report of how far each pair
+moved. The caller should refit the calibration on the result -- calibration and
+registration each need the other, so this is one round of alternating between them, not a
+one-shot fix.
 
-  * Both frames are converted to radiance through `source.load_radiance`. Radiance is light
-    per unit time — the same physical quantity in both frames — so in log space the exposure
-    ratio is a pure additive constant, which `clean_polar_fft`'s `remove_lowfeq` already
-    strips. The objective becomes exposure-invariant by construction and no brightness
-    estimate enters registration at all.
-  * The saturation mask comes from each exposure's own validity (`covered`, i.e. how many
-    frames of the stack could actually be inverted at that pixel) instead of being predicted
-    from the other exposure through a fitted exponent.
-
-`refine_cross_registration` returns a new `cross_reg` and a per-pair report of how far each
-transform moved. The caller is expected to refit the calibration on the result: calibration
-consumes `cross_reg` to find corresponding pixels, so the two are mutually dependent and
-this is one step of an alternation, the same shape as `calib._refine_step` uses for the
-shutter corrections.
-
-Measured on the 2026-08-06 JPEG run (`compare_registration_radiance.py`, control
-bit-identical to stage 2): 12 of 14 pairs move, median 0.36 px, max 0.72 px — 2 to 4 of the
-0.18 px cells the grid search resolves.
+Measured on the real JPEG bracket: 12 of 14 pairs moved, median 0.36 px, max 0.72 px --
+2 to 4 of the 0.18 px cells the grid search can resolve.
 """
 from __future__ import annotations
 
@@ -118,14 +109,13 @@ def _low_quantile(x, valid, q):
 def radiance_pair_images(L0, cov0, L1, cov1, space: str = "log"):
     """Both frames of a pair as comparable images, plus the target's validity mask.
 
-    Nothing is scaled: radiance is already the same quantity in both frames, which is the
-    whole point. Uncovered pixels are held at the floor rather than zeroed — a zero is a hard
-    edge that `remove_lowfeq` would smear across every angular frequency, while a constant is
-    exactly what the low-frequency strip removes. Saturated cores need nothing beyond that:
-    `clean_polar_fft`'s antiprot clip already flattens the top of the range.
+    Nothing is scaled: brightness is already the same quantity in both frames, which is
+    the whole point. Uncovered pixels are held at the floor rather than zeroed -- a zero
+    is a hard edge that the usual low-frequency filtering would smear across every
+    angular frequency, while a constant value is exactly what that filtering removes.
 
     `space="linear"` keeps the current residual's weighting and only fixes the scale;
-    `"log"` additionally makes the objective invariant to the exposure ratio.
+    `"log"` also makes the objective invariant to the exposure ratio.
     """
     assert space in ("log", "linear"), space
     # A pixel no frame covered has Lbar = 0/EPS, and one bad frame can leave a non-finite
