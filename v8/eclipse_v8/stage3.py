@@ -147,6 +147,21 @@ def _amp_cart_to_polar_bilinear(amp, a, r_max, Nr, Ntheta, ci, cj):
     return P
 
 
+def _median_values(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """torch.median(x, dim).values, computed via sort.
+
+    torch.median's CUDA kernel has no deterministic implementation (it also produces
+    `indices`, which ties can't break deterministically) and this file runs under
+    `use_deterministic_algorithms(True)` (see device.py). Sorting to get just the
+    values sidesteps that -- `torch.median` picks the smaller of the two middle
+    values for an even-sized dim, i.e. sorted index `(n - 1) // 2`, which is what
+    this reproduces exactly.
+    """
+    n = x.shape[dim]
+    idx = (n - 1) // 2
+    return x.sort(dim=dim).values.select(dim, idx)
+
+
 def _polar_add_inward_median(P, inward_median_span: int):
     Nr, Ntheta = P.shape
     k = inward_median_span
@@ -155,13 +170,13 @@ def _polar_add_inward_median(P, inward_median_span: int):
     if Nr == 0:
         return P
     if Nr <= k:
-        base = torch.median(P, dim=0).values
+        base = _median_values(P, dim=0)
         return P + base.unsqueeze(0).expand_as(P)
     m = torch.zeros_like(P)
-    m[:k, :] = torch.median(P[0:k, :], dim=0).values.unsqueeze(0).expand(k, -1)
+    m[:k, :] = _median_values(P[0:k, :], dim=0).unsqueeze(0).expand(k, -1)
     unf = P.unfold(0, k, 1)
     take = Nr - k
-    m[k:, :] = torch.median(unf[:take, :, :], dim=2).values
+    m[k:, :] = _median_values(unf[:take, :, :], dim=2)
     return P + m
 
 
