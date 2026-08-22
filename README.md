@@ -1,7 +1,7 @@
 # My attempt to process Solar eclipse images
 
-<a href="https://github.com/JosefSlavicek/e202602_eclipse/blob/main/results/fixed_0052_s1.0000-w12.0000_s2.0000-w6.9282_s4.0000-w4.0000_crop.png">
-  <img src="https://raw.githubusercontent.com/JosefSlavicek/e202602_eclipse/main/results/fixed_0052_s1.0000-w12.0000_s2.0000-w6.9282_s4.0000-w4.0000_crop.png" width="100%" alt="Processed solar eclipse composite">
+<a href="results/fixed_0052_s1.0000-w12.0000_s2.0000-w6.9282_s4.0000-w4.0000_crop.png">
+  <img src="results/fixed_0052_s1.0000-w12.0000_s2.0000-w6.9282_s4.0000-w4.0000_crop.png" width="100%" alt="Processed solar eclipse composite">
 </a>
 
 *(click the image to see it at full resolution)*
