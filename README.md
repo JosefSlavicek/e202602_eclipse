@@ -15,7 +15,7 @@ On the positive side, the postprocessing step that sharpens linear structures (t
 
 ## Running it
 
-You'll need a CUDA-capable GPU.
+You'll need a CUDA-capable GPU. I successfully ran it on machine with 32GB RAM and NVIDIA RTX 3090 GPU.
 
 1. Get the raw data: [`josefslavicek/e202602-eclipse-data2`](https://www.kaggle.com/datasets/josefslavicek/e202602-eclipse-data2) on Kaggle.
 2. Set up the environment from [`environment.yml`](environment.yml):
