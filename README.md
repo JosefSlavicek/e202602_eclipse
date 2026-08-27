@@ -7,7 +7,7 @@
 As a hobby project, I tried my first astrophotography: capturing and processing images of the total solar eclipse of August 12th, from Trigaza Norte o La Zapatera, Spain. I consider the result acceptable, but there's still huge room for improvement:
 
 - The image is grayscale, while the actual thing was rich in fascinating colors.
-- There is heavy postprocessing, which introduces some unpleasant artifacts (1px white ring around moon, unnatural variations of corona brightness, variations of background brightness).
+- There is heavy postprocessing, which introduces some unpleasant artifacts (1px white ring around Moon, unnatural variations of corona brightness, variations of background brightness).
 - My postprocessing gets confused by the brightest inner corona, so I had to extend the Moon's limb, sacrificing some beautiful protuberances.
 - It doesn't model the effects of the atmosphere.
 
