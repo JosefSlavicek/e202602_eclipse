@@ -7,7 +7,7 @@
 As a hobby project, I tried my first astrophotography: capturing and processing images of the total solar eclipse of August 12th, from Trigaza Norte o La Zapatera, Spain. I consider the result acceptable, but there's still huge room for improvement:
 
 - The image is grayscale, while the actual thing was rich in fascinating colors.
-- There is heavy postprocessing, which introduces some unpleasant artifacts.
+- There is heavy postprocessing, which introduces some unpleasant artifacts (1px white ring around Moon, unnatural variations of corona brightness, variations of background brightness).
 - My postprocessing gets confused by the brightest inner corona, so I had to extend the Moon's limb, sacrificing some beautiful protuberances.
 - It doesn't model the effects of the atmosphere.
 
@@ -15,7 +15,7 @@ On the positive side, the postprocessing step that sharpens linear structures (t
 
 ## Running it
 
-You'll need a CUDA-capable GPU.
+You'll need a CUDA-capable GPU. I successfully ran it on machine with 32GB RAM and NVIDIA RTX 3090 GPU.
 
 1. Get the raw data: [`josefslavicek/e202602-eclipse-data2`](https://www.kaggle.com/datasets/josefslavicek/e202602-eclipse-data2) on Kaggle.
 2. Set up the environment from [`environment.yml`](environment.yml):
