@@ -778,13 +778,12 @@ class FocusCamera:
         self.set_config_guarded("viewfinder", 0)
 
     # -- image capture -----------------------------------------------------
-    def _capture_image_once(self) -> tuple[np.ndarray, bytes, str]:
-        # Trigger a real exposure, download the resulting file off the card,
-        # decode it, then delete it from the card so we do not fill it during a
-        # long hunt. NOTE: the camera must be shooting a decodable format (JPEG);
-        # a RAW-only (.NEF) frame will NOT decode with cv2.imdecode.
-        # Returns (decoded BGR image, raw file bytes, original filename) so the
-        # caller can persist the exact downloaded file under a merit-tagged name.
+    def _capture_raw_once(self) -> tuple[bytes, str]:
+        # Trigger a real exposure, download the resulting file off the card, then
+        # delete it from the card so we do not fill it during a long session.
+        # Returns (raw file bytes, original camera filename). No decoding happens
+        # here, so this is also usable for RAW/.NEF frames (which cv2 cannot
+        # decode) -- the caller decodes however it likes.
         err, path = gp.gp_camera_capture(
             self.camera, gp.GP_CAPTURE_IMAGE, self.context)
         assert err == gp.GP_OK, ("capture", err)
@@ -797,19 +796,28 @@ class FocusCamera:
         err, data = gp.gp_file_get_data_and_size(cam_file)
         assert err == gp.GP_OK, ("get_data", err)
         raw = memoryview(data).tobytes()
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         # best-effort cleanup; failure to delete is non-fatal
         try:
             gp.gp_camera_file_delete(
                 self.camera, path.folder, path.name, self.context)
         except Exception:
             pass
+        return raw, path.name
+
+    def _capture_image_once(self) -> tuple[np.ndarray, bytes, str]:
+        # As _capture_raw_once, then decode to BGR. NOTE: the camera must be
+        # shooting a decodable format (JPEG); a RAW-only (.NEF) frame will NOT
+        # decode with cv2.imdecode. Returns (decoded BGR image, raw file bytes,
+        # original filename) so the caller can persist the exact downloaded file
+        # under a merit-tagged name.
+        raw, name = self._capture_raw_once()
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise RuntimeError(
-                f"captured image {path.name} failed to decode "
+                f"captured image {name} failed to decode "
                 f"(shooting RAW/.NEF? set the camera to JPEG)")
-        return img, raw, path.name
+        return img, raw, name
 
     def capture_image(self) -> tuple[np.ndarray, bytes, str]:
         """Shoot one full-resolution frame, self-healing on error.
@@ -819,6 +827,22 @@ class FocusCamera:
         for attempt in range(MAX_RETRY + 1):
             try:
                 return self._capture_image_once()
+            except Exception as e:
+                print(f"[warn] capture failed (try {attempt + 1}/"
+                      f"{MAX_RETRY + 1}): {e}")
+                if attempt < MAX_RETRY:
+                    self.reset()
+        raise RuntimeError("image capture failed after retries")
+
+    def capture_raw(self) -> tuple[bytes, str]:
+        """Shoot one full-resolution frame, self-healing on error; no decode.
+
+        Returns (raw file bytes, original camera filename). Use this instead of
+        capture_image() for RAW formats (.NEF) that cv2.imdecode cannot handle.
+        """
+        for attempt in range(MAX_RETRY + 1):
+            try:
+                return self._capture_raw_once()
             except Exception as e:
                 print(f"[warn] capture failed (try {attempt + 1}/"
                       f"{MAX_RETRY + 1}): {e}")
