@@ -43,7 +43,7 @@ Run with the python that has gphoto2 + rawpy + OpenCV + matplotlib.
 
 Usage
 -----
-    camera/get_histogram.py [--lasso-file PATH]
+    camera/get_histogram.py [--lasso-file PATH] [--debug-layout]
 """
 from __future__ import annotations
 
@@ -90,6 +90,7 @@ CLIP_FRAC = 0.99             # pixel >= this * white -> counted as clipped
 STRETCH_MAX = 3000           # slider range for the asinh display stretch
 STRETCH_DEFAULT = 400
 DEFAULT_LASSO_FILE = "get_histogram_lasso.json"
+RESIZE_DELAY_MS = 60         # wait this long after the last resize to redraw
 
 # channel -> (matplotlib colour, label)
 CHANNELS = [(0, "#d62728", "R"), (1, "#2ca02c", "G"), (2, "#1f77b4", "B")]
@@ -178,7 +179,7 @@ class Viewer:
     """Integer-zoom pannable inspector with a lasso and RGB histograms."""
 
     def __init__(self, cam: FocusCamera, rgb16: np.ndarray,
-                 lasso_file: str) -> None:
+                 lasso_file: str, debug_layout: bool = False) -> None:
         self.cam = cam
         self.rgb16 = rgb16
         self.lasso_file = lasso_file
@@ -197,6 +198,10 @@ class Viewer:
         self._select_mode = False
         self._lasso: list[tuple[int, int]] = []
         self._capturing = False
+        self._last_view_size = None      # last <Configure> size of the view
+        self._resize_job = None          # pending after() id for a resize
+        self.debug_layout = debug_layout
+        self._n_render = 0
 
         self._build_ui()
         self.root.update_idletasks()
@@ -255,13 +260,11 @@ class Viewer:
         body = tk.Frame(self.root)
         body.pack(side="top", fill="both", expand=True)
 
-        self.view = tk.Label(body, bg="black")
-        self.view.pack(side="left", fill="both", expand=True)
-        self.view.bind("<Configure>", lambda _e: self.render())
-        self.view.bind("<Button-1>", self._on_press)
-        self.view.bind("<B1-Motion>", self._on_drag)
-        self.view.bind("<ButtonRelease-1>", self._on_release)
-
+        # The histogram canvas is packed BEFORE the image view, so pack gives
+        # it its width first and the view only gets what is left. Otherwise a
+        # view that asks for a few px more than it has (image + border) keeps
+        # taking width from the histogram panel, which fires <Configure>,
+        # which re-renders a bigger image, and so on until the panel is gone.
         self.fig = Figure(figsize=(4.4, 7.0), dpi=100)
         self.ax_full = self.fig.add_subplot(211)
         self.ax_sel = self.fig.add_subplot(212)
@@ -270,6 +273,16 @@ class Viewer:
         self.canvas = FigureCanvasTkAgg(self.fig, master=body)
         self.canvas.get_tk_widget().configure(width=460)
         self.canvas.get_tk_widget().pack(side="right", fill="y")
+
+        # No border / padding, so the rendered image asks for exactly the
+        # size the label already has.
+        self.view = tk.Label(body, bg="black", borderwidth=0,
+                             highlightthickness=0, padx=0, pady=0)
+        self.view.pack(side="left", fill="both", expand=True)
+        self.view.bind("<Configure>", self._on_view_configure)
+        self.view.bind("<Button-1>", self._on_press)
+        self.view.bind("<B1-Motion>", self._on_drag)
+        self.view.bind("<ButtonRelease-1>", self._on_release)
 
         self.root.bind("<Key>", self._on_key)
 
@@ -306,6 +319,25 @@ class Viewer:
         return "break"
 
     # -- viewport size ----------------------------------------------------
+    def _on_view_configure(self, e) -> None:
+        """Re-render after the view really changed size, at most once per
+        burst of resize events."""
+        size = (e.width, e.height)
+        if self.debug_layout:
+            print(f"[layout] <Configure> view={e.width}x{e.height} "
+                  f"hist_panel={self.canvas.get_tk_widget().winfo_width()}x"
+                  f"{self.canvas.get_tk_widget().winfo_height()}")
+        if size == self._last_view_size:
+            return
+        self._last_view_size = size
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(RESIZE_DELAY_MS, self._resize_render)
+
+    def _resize_render(self) -> None:
+        self._resize_job = None
+        self.render()
+
     def _view_size(self) -> tuple[int, int]:
         w, h = self.view.winfo_width(), self.view.winfo_height()
         if w <= 1 or h <= 1:
@@ -580,6 +612,14 @@ class Viewer:
         if self._capturing:
             return
         vw, vh = self._view_size()
+        self._n_render += 1
+        if self.debug_layout:
+            hw = self.canvas.get_tk_widget()
+            print(f"[layout] render #{self._n_render}: image={vw}x{vh} "
+                  f"view={self.view.winfo_width()}x{self.view.winfo_height()} "
+                  f"hist_panel={hw.winfo_width()}x{hw.winfo_height()} "
+                  f"window={self.root.winfo_width()}x"
+                  f"{self.root.winfo_height()}")
         frame, self.cx, self.cy, self.vis_w, self.vis_h, self.vt = \
             render_viewport(self.disp, self.num, self.den,
                             self.cx, self.cy, vw, vh)
@@ -628,6 +668,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help=f"where the selection polygon is saved / loaded "
                         f"(default: ./{DEFAULT_LASSO_FILE} in the current "
                         f"folder)")
+    p.add_argument("--debug-layout", action="store_true",
+                   help="print widget sizes on every resize event and "
+                        "every image render (to diagnose redraw loops)")
     return p.parse_args(argv)
 
 
@@ -657,7 +700,8 @@ def main() -> int:
 
     try:
         print("[info] opening viewer")
-        Viewer(cam, rgb16, args.lasso_file).run()
+        Viewer(cam, rgb16, args.lasso_file,
+               debug_layout=args.debug_layout).run()
     finally:
         cam.close()
     return 0
