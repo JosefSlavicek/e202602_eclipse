@@ -34,9 +34,9 @@ import requests
 
 # name, latitude, longitude, elevation [m]
 PLACES = [
-    ("Praděd", 50.0832, 17.2309, 1491),
-    ("Červenohorské sedlo", 50.1250, 17.1547, 1013),
     ("Dlouhé stráně - horní nádrž", 50.0750, 17.1594, 1350),
+    ("Sloup", 49.4292008, 16.7568661, 480),
+    ("Vítochov", 49.5694436, 16.2518000, 610),
 ]
 
 # Open-Meteo model id, short label
