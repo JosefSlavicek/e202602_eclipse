@@ -151,14 +151,20 @@ def worker(wid: int, tasks, results, fake: dict | None) -> None:
         results.put(result_of(idx, offset, res, wid, t1 - t0, t2 - t1))
 
 
+PER_STAR = ("m_mag", "m_rank", "m_size", "m_usable", "acc_mag", "drift_corr")
+
+
 def result_of(idx, offset, res, wid, decode_s, score_s) -> dict:
-    return dict(idx=idx, offset=offset, ok=res["ok"],
-                reason=res.get("reason", ""),
-                stars=res.get("score", float("nan")),
-                fwhm=res.get("fwhm", float("nan")),
-                n_det=res["n_det"], n_on=res.get("n_on", 0),
-                n_ref=res.get("n_ref", 0), wid=wid,
-                decode=decode_s, score=score_s)
+    out = dict(idx=idx, offset=offset, ok=res["ok"],
+               reason=res.get("reason", ""),
+               stars=res.get("score", float("nan")),
+               fwhm=res.get("fwhm", float("nan")),
+               n_det=res["n_det"], n_on=res.get("n_on", 0),
+               n_ref=res.get("n_ref", 0), wid=wid,
+               decode=decode_s, score=score_s)
+    if res["ok"]:             # per-star detail, for re-scoring star subsets
+        out.update({k: res[k] for k in PER_STAR})
+    return out
 
 
 # ==========================================================================
@@ -259,18 +265,12 @@ def means_by_position(x: np.ndarray, y: np.ndarray):
 
 class Plot:
     def __init__(self, width: int, results, status: list, fake: bool):
-        import matplotlib
-        matplotlib.use("TkAgg")
-        matplotlib.rcParams["toolbar"] = "None"
-        import matplotlib.pyplot as plt
-        self.plt = plt
         self.results = results
         self.status = status
         self.data = []            # (offset, stars, fwhm)
         self.prefix = "FAKE DATA -- " if fake else ""
 
-        self.fig = plt.figure(figsize=(12, 6), facecolor="white")
-        self.fig.canvas.manager.set_window_title("focus hunt")
+        self.fig = self.make_figure()
         ax = self.fig.add_subplot(111, facecolor="white")
         ax2 = ax.twinx()
         self.ax, self.ax2 = ax, ax2
@@ -315,7 +315,35 @@ class Plot:
         self.timer.start()
         self.fig.tight_layout()
 
+    # -- window ------------------------------------------------------------
+    def make_figure(self):
+        import matplotlib
+        matplotlib.use("TkAgg")
+        matplotlib.rcParams["toolbar"] = "None"
+        import matplotlib.pyplot as plt
+        self.plt = plt
+        fig = plt.figure(figsize=(12, 6), facecolor="white")
+        fig.canvas.manager.set_window_title("focus hunt")
+        return fig
+
+    def on_close(self, callback) -> None:
+        self.fig.canvas.mpl_connect("close_event", lambda _e: callback())
+
+    def close(self) -> None:
+        self.plt.close(self.fig)
+
+    def run(self) -> None:
+        self.plt.show()
+
     # -- data --------------------------------------------------------------
+    def add(self, r: dict) -> None:
+        self.data.append((r["offset"], r["stars"], r["fwhm"]))
+
+    def series(self):
+        """(offsets, star counts, FWHMs) of all frames, as arrays."""
+        d = np.array(self.data, float).reshape(-1, 3)
+        return d[:, 0], d[:, 1], d[:, 2]
+
     def poll(self) -> None:
         new = False
         while True:
@@ -334,17 +362,17 @@ class Plot:
                 print(f"  [warn] field drifted: {r['n_ref'] - r['n_on']} of "
                       f"{r['n_ref']} patch stars off the sensor (count scaled "
                       f"up to match); re-centre the mount if this grows")
-            self.data.append((r["offset"], r["stars"], r["fwhm"]))
+            self.add(r)
             new = True
         if new or self.status[0] != getattr(self, "_shown_status", None):
             self.redraw()
 
     def redraw(self) -> None:
-        d = np.array(self.data, float).reshape(-1, 3)
-        self.stars_pts.set_data(d[:, 0], d[:, 1])
-        self.fwhm_pts.set_data(d[:, 0], d[:, 2])
-        self.stars_line.set_data(*means_by_position(d[:, 0], d[:, 1]))
-        self.fwhm_line.set_data(*means_by_position(d[:, 0], d[:, 2]))
+        x, stars, fwhm = self.series()
+        self.stars_pts.set_data(x, stars)
+        self.fwhm_pts.set_data(x, fwhm)
+        self.stars_line.set_data(*means_by_position(x, stars))
+        self.fwhm_line.set_data(*means_by_position(x, fwhm))
         for a in (self.ax, self.ax2):
             a.relim()
             a.autoscale_view(scalex=False)
@@ -382,14 +410,12 @@ class Plot:
             self.ax2.draw_artist(self.vlabel)
         c.blit(self.fig.bbox)
 
-    def run(self) -> None:
-        self.plt.show()
 
 
 # ==========================================================================
-def parse_args(argv=None):
+def parse_args(argv=None, doc=__doc__):
     p = argparse.ArgumentParser(
-        description=__doc__,
+        description=doc,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("width", type=int,
                    help="scan focus in [start - WIDTH, start + WIDTH] "
@@ -400,8 +426,8 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
+def main(argv=None, plot_cls=Plot, doc=__doc__) -> int:
+    args = parse_args(argv, doc)
     width = args.width // 4 * 4
     if width < 4:
         print("WIDTH must be at least 4")
@@ -426,15 +452,15 @@ def main(argv=None) -> int:
 
     stop = threading.Event()
     status = ["starting the camera"]
-    plot = Plot(width, results, status, fake is not None)
+    plot = plot_cls(width, results, status, fake is not None)
     cam_thread = threading.Thread(target=camera_loop, daemon=True,
                                   args=(width, tasks, results, stop, status,
                                         fake))
     cam_thread.start()
 
     # closing the window ends the run; Ctrl+C in the terminal closes it
-    plot.fig.canvas.mpl_connect("close_event", lambda _e: stop.set())
-    signal.signal(signal.SIGINT, lambda *_: plot.plt.close(plot.fig))
+    plot.on_close(stop.set)
+    signal.signal(signal.SIGINT, lambda *_: plot.close())
     try:
         plot.run()
     finally:
