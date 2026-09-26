@@ -136,22 +136,23 @@ def worker(wid: int, tasks, results, fake: dict | None) -> None:
             return
         idx, offset, raw, name, seed, ref = job
         t0 = time.time()
-        gray = sm.gray_from_raw(raw, name)
+        gray, rgb16 = sm.frame_from_raw(raw, name)
         del raw
         if fake:              # decoded honestly above, but scored synthetic
-            gray = frames[fake_level(offset, fake)]
+            gray, rgb16 = frames[fake_level(offset, fake)], None
         t1 = time.time()
-        res = sm.score_frame(gray, deep, sol or seed, ref=ref)
+        res = sm.score_frame(gray, deep, sol or seed, ref=ref, rgb16=rgb16)
         if not res["ok"] and sol is not None:
             # this worker's transform may be stale; the shared seed is not
-            res = sm.score_frame(gray, deep, seed, ref=ref)
+            res = sm.score_frame(gray, deep, seed, ref=ref, rgb16=rgb16)
         t2 = time.time()
         if res["ok"]:
             sol = res["sol"]
         results.put(result_of(idx, offset, res, wid, t1 - t0, t2 - t1))
 
 
-PER_STAR = ("m_mag", "m_rank", "m_size", "m_usable", "acc_mag", "drift_corr")
+PER_STAR = ("m_mag", "m_rank", "m_size", "m_usable", "m_sat", "acc_mag",
+            "drift_corr")
 
 
 def result_of(idx, offset, res, wid, decode_s, score_s) -> dict:
@@ -194,7 +195,7 @@ def camera_loop(width: int, tasks, results, stop: threading.Event,
             status[0] = f"solving the first frame (try {attempt + 1})"
             raw, name = cam.capture_raw()
             t0 = time.time()
-            gray = sm.gray_from_raw(raw, name)
+            gray, rgb16 = sm.frame_from_raw(raw, name)
             del raw
             t1 = time.time()
             time.sleep(sm.CAP_SETTLE_S)
@@ -202,7 +203,7 @@ def camera_loop(width: int, tasks, results, stop: threading.Event,
             if sol is None:
                 print(f"[warn] blind solve failed on {name}")
                 continue
-            res = sm.score_frame(gray, deep, sol)
+            res = sm.score_frame(gray, deep, sol, rgb16=rgb16)
             if not res["ok"]:
                 print(f"[warn] first frame did not score: {res['reason']}")
                 continue

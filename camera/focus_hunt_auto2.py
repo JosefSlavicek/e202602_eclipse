@@ -9,7 +9,9 @@ scored in the background, runs until the window is closed, focus left where
 the last shot put it), with one addition: a panel right of the plot lists the
 catalogue magnitude bins (1 mag wide) of the identified stars.  Each row shows
 the largest number of stars of that bin identified in any one frame so far,
-and has a checkbox, checked by default.  The plot uses only the stars of the
+and, in that same frame, the fraction of them with at least one saturated
+pixel (any colour channel >= star_metric.SAT_LEVEL, 90% of the sensor's
+range).  Each row has a checkbox, checked by default.  The plot uses only the stars of the
 checked bins:
 
   * blue -- identified stars in the checked bins, minus the accidental matches
@@ -36,7 +38,8 @@ class Plot2(base.Plot):
     def __init__(self, width: int, results, status: list, fake: bool):
         self.frames = []          # per frame: offset, bins and per-star data
         self.cache = {}           # frame index -> (stars, fwhm) for `checked`
-        self.rows = {}            # mag bin -> (BooleanVar, Checkbutton, Label)
+        self.rows = {}            # mag bin -> (BooleanVar, Checkbutton,
+                                  #             count Label, saturated Label)
         self.max_n = {}           # mag bin -> most stars in one frame
         super().__init__(width, results, status, fake)
 
@@ -63,6 +66,9 @@ class Plot2(base.Plot):
         tk.Label(self.panel, text="max stars", bg="white",
                  font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=1, sticky="e", padx=(12, 0))
+        tk.Label(self.panel, text="saturated", bg="white",
+                 font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=2, sticky="e", padx=(12, 0))
 
         fig = Figure(figsize=(12, 6), facecolor="white")
         canvas = FigureCanvasTkAgg(fig, master=self.root)
@@ -90,13 +96,15 @@ class Plot2(base.Plot):
                             activebackground="white", highlightthickness=0,
                             anchor="w")
         lbl = tk.Label(self.panel, text="0", bg="white", anchor="e")
-        self.rows[b] = (var, cb, lbl)
+        sat = tk.Label(self.panel, text="", bg="white", anchor="e")
+        self.rows[b] = (var, cb, lbl, sat)
         for i, k in enumerate(sorted(self.rows)):     # keep rows in mag order
             self.rows[k][1].grid(row=i + 1, column=0, sticky="w")
             self.rows[k][2].grid(row=i + 1, column=1, sticky="e", padx=(12, 0))
+            self.rows[k][3].grid(row=i + 1, column=2, sticky="e", padx=(12, 0))
 
     def checked(self) -> np.ndarray:
-        return np.array([b for b, (v, _, _) in self.rows.items() if v.get()],
+        return np.array([b for b, (v, *_) in self.rows.items() if v.get()],
                         int)
 
     def on_toggle(self) -> None:
@@ -112,13 +120,16 @@ class Plot2(base.Plot):
                  m_rank=r["m_rank"], m_size=r["m_size"],
                  m_usable=r["m_usable"])
         self.frames.append(f)
-        bins, counts = np.unique(f["m_bin"], return_counts=True)
-        for b, n in zip(bins.tolist(), counts.tolist()):
+        bins, inv, counts = np.unique(f["m_bin"], return_inverse=True,
+                                      return_counts=True)
+        n_sat = np.bincount(inv, weights=r["m_sat"], minlength=bins.size)
+        for b, n, ns in zip(bins.tolist(), counts.tolist(), n_sat.tolist()):
             if b not in self.rows:
                 self.add_row(b)
             if n > self.max_n.get(b, 0):
                 self.max_n[b] = n
                 self.rows[b][2].configure(text=str(n))
+                self.rows[b][3].configure(text=f"{ns / n:.4f}")
 
     def score(self, i: int, sel: np.ndarray):
         if i not in self.cache:
