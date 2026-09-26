@@ -1,14 +1,13 @@
 #!/usr/bin/env python
-"""Offline checks for focus_hunt_auto.py -- no camera, no network.
+"""Offline checks for star_metric.py -- no camera, no network.
 
 Builds synthetic star fields (real HYG stars for the bright end so the blind
 solver has something to lock onto, plus generated faint stars) at a range of
-blur levels, and checks that the metric falls as the blur grows.  Then drives
-the search loop against a simulated focus curve to check the step-halving and
-edge-walking rules converge.
+blur levels, and checks that the star count falls and the measured star size
+grows as the blur grows.
 
-    python camera/focus_hunt_auto_selftest.py           # everything
-    python camera/focus_hunt_auto_selftest.py --quick   # skip the image tests
+    python camera/star_metric_selftest.py           # everything
+    python camera/star_metric_selftest.py --quick   # skip the image tests
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ import time
 import numpy as np
 
 import find_it
-import focus_hunt_auto as fha
+import star_metric as fha
 
 # synthetic rig: half the Z6's pixel count in each axis keeps the tests quick
 # while leaving the arcsec/px and the star density per pixel realistic -- the
@@ -36,7 +35,7 @@ FLUX_AT_15 = 417.0     # total counts of a mag-15 star (marginal at FWHM 2)
 SAT = 65535.0
 
 CONE_DEG = 4.0         # synthetic catalogue cone radius
-FAINT_MAG = 16.5       # synthetic catalogue depth (as focus_hunt_auto.DEEP_MAG)
+FAINT_MAG = 16.5       # synthetic catalogue depth (as star_metric.DEEP_MAG)
 FAINT_SLOPE = 0.35     # log10 N(<m) slope; ~the real count slope off the plane
 N_AT_MAG12 = 46.0      # stars per sq deg brighter than mag 12 near M31. Back
                        #  -calculated from the real catalogue built on
@@ -177,84 +176,6 @@ def test_limiting_mag() -> bool:
     return ok
 
 
-def test_winner_logic() -> bool:
-    print("\n== winner test ==")
-    ok = True
-    flat = {p: [1000.0, 1001.0] for p in (-64, -32, 0, 32, 64)}
-    ok &= fha.pick_winner(flat) is None
-    print(f"  flat curve -> no winner: {fha.pick_winner(flat) is None}")
-
-    peak = {-64: [800.0, 802.0], -32: [900.0, 898.0], 0: [1000.0, 1001.0],
-            32: [900.0, 901.0], 64: [800.0, 799.0]}
-    w = fha.pick_winner(peak)
-    ok &= w is not None and w[0] == 0
-    print(f"  clear peak -> winner at {w[0] if w else None} (want 0)")
-
-    # a lead inside the noise must not win
-    noisy = {-64: [800.0, 950.0], -32: [960.0, 800.0], 0: [1000.0, 810.0],
-             32: [820.0, 990.0], 64: [990.0, 805.0]}
-    ok &= fha.pick_winner(noisy) is None
-    print(f"  noise-dominated -> no winner: {fha.pick_winner(noisy) is None}")
-    return ok
-
-
-class _FakeCam:
-    def __init__(self):
-        self.pos = 0
-
-    def move_to(self, p, **kw):
-        self.pos = p
-
-
-class _SimHunt(fha.Hunt):
-    """Hunt with the camera replaced by an analytic focus curve."""
-
-    def __init__(self, true_pos, sigma, rng, args):
-        super().__init__(_FakeCam(), None, args, "")
-        self.true_pos = true_pos
-        self.sigma = sigma
-        self.rng = rng
-        self.calls = 0
-
-    def measure(self, pos, tag):
-        self.calls += 1
-        n = 3000.0 * math.exp(-0.5 * ((pos - self.true_pos) / 30.0) ** 2)
-        n += self.rng.normal(0.0, self.sigma)
-        return {"ok": True, "score": n, "n_det": int(n), "n_false": 0,
-                "lim_mag": float("nan"), "zp": float("nan"),
-                "zp_scatter": float("nan")}
-
-
-def test_search(verbose=False) -> bool:
-    print("\n== search loop (simulated focus curve) ==")
-    args = fha.parse_args([])
-    ok = True
-    hits = 0
-    trials = 8
-    for seed in range(trials):
-        rng = np.random.default_rng(seed)
-        true_pos = int(rng.integers(-70, 71))
-        h = _SimHunt(true_pos, 6.0, rng, args)
-        if not verbose:
-            out = sys.stdout
-            sys.stdout = open(os.devnull, "w")
-        try:
-            best, clean = h.run(0, args.step)
-        finally:
-            if not verbose:
-                sys.stdout.close()
-                sys.stdout = out
-        err = abs(best - true_pos)
-        good = err <= 6
-        hits += good
-        print(f"  true={true_pos:+4d} -> best={best:+4d} err={err:2d} "
-              f"frames={h.calls:3d} {'clean' if clean else 'premature'} "
-              f"{'ok' if good else 'FAIL'}")
-    ok &= hits >= trials - 1
-    print(f"  {hits}/{trials} converged within 6 focus units")
-    return ok
-
-
 def test_metric_vs_blur(fwhms) -> bool:
     print("\n== metric vs blur (synthetic frames) ==")
     rng = np.random.default_rng(7)
@@ -267,8 +188,9 @@ def test_metric_vs_blur(fwhms) -> bool:
 
     deep = cat
     seed = seed_solution(ra0, dec0, roll)
-    scores = []
-    print("   fwhm       N   n_acc  lim_mag    zp   scat   false  n_det   rms")
+    scores, sizes = [], []
+    print("   fwhm       N   n_acc  lim_mag    zp   scat   false  n_det   rms"
+          "  meas_fwhm")
     for fw in fwhms:
         t0 = time.time()
         img = render(cat, ra0, dec0, roll, fw, rng)
@@ -277,15 +199,18 @@ def test_metric_vs_blur(fwhms) -> bool:
             print(f"  {fw:5.1f}  FAILED: {res['reason']}")
             return False
         scores.append(res["score"])
+        sizes.append(res["fwhm"])
         print(f"  {fw:5.1f} {res['score']:7.0f} {res['n_acc']:6d} "
               f"{res['lim_mag']:8.2f} {res['zp']:6.2f} {res['zp_scatter']:6.2f} "
               f"{res['n_false']:6d} {res['n_det']:6d} {res['rms']:5.2f} "
-              f"  [{time.time() - t0:.1f}s]")
+              f"{res['fwhm']:9.2f}  [{time.time() - t0:.1f}s]")
 
     mono = all(scores[i] > scores[i + 1] for i in range(len(scores) - 1))
     drop = scores[0] / max(1.0, scores[-1])
     print(f"  monotonically falling: {mono};  sharpest/blurriest = {drop:.1f}x")
-    return mono and drop > 3.0
+    grow = all(sizes[i] < sizes[i + 1] for i in range(len(sizes) - 1))
+    print(f"  measured star size monotonically growing: {grow}")
+    return mono and drop > 3.0 and grow
 
 
 def test_drift(n=14, step_px=30.0, fwhm=3.0) -> bool:
@@ -363,14 +288,11 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--quick", action="store_true",
                    help="skip the synthetic-image tests")
-    p.add_argument("--verbose-search", action="store_true")
     a = p.parse_args(argv)
 
     results = {
         "match_one_to_one": test_match_one_to_one(),
         "limiting_mag": test_limiting_mag(),
-        "winner_logic": test_winner_logic(),
-        "search_loop": test_search(a.verbose_search),
     }
     if not a.quick:
         results["metric_vs_blur"] = test_metric_vs_blur(
