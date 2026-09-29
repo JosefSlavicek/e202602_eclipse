@@ -4,8 +4,12 @@
 A stripped-down relative of ``focus_hunt_stars.py``. It keeps that script's
 zoomable / pannable image viewer and its freehand-lasso region tool, and throws
 away everything else: no sharpness metric, no over-burn bar, no focus drive, no
-image-quality changes. The camera is used exactly as it is currently set -- the
-script only opens it, takes a full-resolution shot, downloads it and closes.
+image-quality changes. The camera is used as it is currently set, except for
+the shutter speed: the exposure time given on the command line is set the same
+way andromeda.py does it --
+  * up to 30 s: the nearest shorter hardware-timed preset,
+  * over 30 s: Bulb mode, the shutter held open by the PC for that long.
+Each frame is downloaded and deleted from the card.
 
 What it does
 ------------
@@ -20,9 +24,9 @@ What it does
     selected area" are then computed inside that polygon. The polygon is saved
     to a file in the current folder and reloaded on the next run.
 
-  * ``Re-capture`` -- take another shot with whatever settings are on the camera
-    right now (change ISO / shutter on the camera body first if you like). The
-    lasso and the zoom / pan are kept.
+  * ``Re-capture`` -- take another shot with the same exposure time and
+    whatever other settings are on the camera right now (change ISO on the
+    camera body first if you like). The lasso and the zoom / pan are kept.
 
   * Histogram panel (right) -- six curves: R, G, B for the whole image, and
     R, G, B for the selected area (blank until something is selected). Linear
@@ -43,7 +47,7 @@ Run with the python that has gphoto2 + rawpy + OpenCV + matplotlib.
 
 Usage
 -----
-    camera/get_histogram.py [--lasso-file PATH] [--debug-layout]
+    camera/get_histogram.py EXPOSURE_S [--lasso-file PATH] [--debug-layout]
 """
 from __future__ import annotations
 
@@ -54,12 +58,15 @@ import json
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from focus_hunt import FocusCamera  # noqa: E402
+from andromeda import MAX_TIMED_SECONDS, nearest_shorter_preset  # noqa: E402
+import gphoto2 as gp  # noqa: E402
 
 try:
     import tkinter as tk
@@ -94,6 +101,68 @@ RESIZE_DELAY_MS = 60         # wait this long after the last resize to redraw
 
 # channel -> (matplotlib colour, label)
 CHANNELS = [(0, "#d62728", "R"), (1, "#2ca02c", "G"), (2, "#1f77b4", "B")]
+
+
+# ---------------------------------------------------------------------------
+# Capture
+# ---------------------------------------------------------------------------
+BULB_FILE_WAIT_S = 60.0      # after closing a Bulb exposure, wait this long for
+                             #  the file to appear. Longer than andromeda.py's
+                             #  10 s because long-exposure NR is left as it is
+                             #  on the camera, and if on it adds a dark frame
+                             #  as long as the exposure itself
+
+
+def capture_exposure(cam: FocusCamera, exposure: float) -> tuple[bytes, str]:
+    """Shoot one frame of `exposure` seconds, as andromeda.py does.
+
+    Up to MAX_TIMED_SECONDS: set the nearest shorter preset and let the camera
+    time it.  Longer: Bulb, with the shutter opened and closed from here.
+    Returns (raw file bytes, camera file name); the file is deleted from the
+    card after download.
+    """
+    if exposure <= MAX_TIMED_SECONDS:
+        sec, name = nearest_shorter_preset(exposure)
+        if abs(sec - exposure) > 1e-6:
+            print(f"[exposure] requested {exposure:.4f}s -> using nearest "
+                  f"shorter preset {name}")
+        cam._set_config("shutterspeed", name)
+        return cam.capture_raw()
+
+    print(f"[exposure] Bulb, {exposure:.3f}s")
+    cam._set_config("capturetarget", "Memory card")   # as andromeda.py
+    cam._set_config("shutterspeed", "Bulb")
+    cam._set_config("bulb", 1)
+    try:
+        time.sleep(exposure)
+    finally:
+        cam._set_config("bulb", 0)
+
+    deadline = time.time() + BULB_FILE_WAIT_S
+    while True:
+        if time.time() > deadline:
+            raise RuntimeError(f"no file from the camera {BULB_FILE_WAIT_S:.0f}"
+                               f" s after the Bulb exposure ended")
+        err, ev_type, ev_data = gp.gp_camera_wait_for_event(
+            cam.camera, 200, cam.context)
+        assert err == gp.GP_OK, ("wait_for_event", err)
+        if ev_type == gp.GP_EVENT_FILE_ADDED:
+            folder, name = ev_data.folder, ev_data.name
+            break
+
+    err, cam_file = gp.gp_file_new()
+    assert err == gp.GP_OK, ("file_new", err)
+    err = gp.gp_camera_file_get(cam.camera, folder, name,
+                                gp.GP_FILE_TYPE_NORMAL, cam_file, cam.context)
+    assert err == gp.GP_OK, ("file_get", err)
+    err, data = gp.gp_file_get_data_and_size(cam_file)
+    assert err == gp.GP_OK, ("get_data", err)
+    raw = memoryview(data).tobytes()
+    try:                           # best-effort, as FocusCamera does
+        gp.gp_camera_file_delete(cam.camera, folder, name, cam.context)
+    except Exception:
+        pass
+    return raw, name
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +248,10 @@ class Viewer:
     """Integer-zoom pannable inspector with a lasso and RGB histograms."""
 
     def __init__(self, cam: FocusCamera, rgb16: np.ndarray,
-                 lasso_file: str, debug_layout: bool = False) -> None:
+                 lasso_file: str, exposure: float,
+                 debug_layout: bool = False) -> None:
         self.cam = cam
+        self.exposure = exposure
         self.rgb16 = rgb16
         self.lasso_file = lasso_file
 
@@ -573,7 +644,7 @@ class Viewer:
         self._capturing = True
         self._show_capturing()
         try:
-            raw, name = self.cam.capture_raw()
+            raw, name = capture_exposure(self.cam, self.exposure)
             print(f"[capture] {name} bytes={len(raw)}")
             rgb16 = decode_nef(raw, name)
         except Exception as e:
@@ -664,6 +735,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Shoot one NEF frame and inspect its RGB histograms "
                     "(whole image + a freehand-selected area).")
+    p.add_argument("exposure", type=float,
+                   help=f"exposure time in seconds; up to "
+                        f"{MAX_TIMED_SECONDS:g} s the nearest shorter camera "
+                        f"preset is used, longer exposures use Bulb")
     p.add_argument("--lasso-file", default=DEFAULT_LASSO_FILE,
                    help=f"where the selection polygon is saved / loaded "
                         f"(default: ./{DEFAULT_LASSO_FILE} in the current "
@@ -671,7 +746,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--debug-layout", action="store_true",
                    help="print widget sizes on every resize event and "
                         "every image render (to diagnose redraw loops)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.exposure <= 0:
+        p.error("exposure must be positive")
+    return args
 
 
 def main() -> int:
@@ -685,8 +763,9 @@ def main() -> int:
         cam.open()
         cur = cam.get_config_value("imagequality")
         print(f"[info] camera image quality (left as-is): {cur}")
-        print("[info] taking one frame with the camera's current settings")
-        raw, name = cam.capture_raw()
+        print(f"[info] taking one {args.exposure:g} s frame; other settings "
+              f"as on the camera")
+        raw, name = capture_exposure(cam, args.exposure)
         print(f"[capture] {name} bytes={len(raw)}")
         rgb16 = decode_nef(raw, name)
     except KeyboardInterrupt:
@@ -700,7 +779,7 @@ def main() -> int:
 
     try:
         print("[info] opening viewer")
-        Viewer(cam, rgb16, args.lasso_file,
+        Viewer(cam, rgb16, args.lasso_file, args.exposure,
                debug_layout=args.debug_layout).run()
     finally:
         cam.close()
