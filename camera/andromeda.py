@@ -24,6 +24,14 @@ _PRESETS = sorted((float(s[:-1]), s) for s in SHUTTERSPEED_PRESETS)
 MAX_TIMED_SECONDS = _PRESETS[-1][0]  # 30.0
 
 
+# Exposure ladder: after every LADDER_EVERY main frames (except after the last
+# one) shoot a run of shorter exposures, each LADDER_FACTOR x shorter than the
+# one before, always ending at exactly LADDER_FLOOR seconds.
+LADDER_EVERY = 20
+LADDER_FACTOR = 10.0
+LADDER_FLOOR = 0.01
+
+
 def nearest_shorter_preset(seconds):
     """Largest preset that is <= seconds. Falls back to the shortest preset
     if the request is below everything we can do."""
@@ -33,15 +41,75 @@ def nearest_shorter_preset(seconds):
     return _PRESETS[0]
 
 
+def shutter_setting(seconds):
+    """The camera 'shutterspeed' value a request of `seconds` really uses."""
+    if seconds > MAX_TIMED_SECONDS:
+        return 'Bulb'
+    return nearest_shorter_preset(seconds)[1]
+
+
+def ladder(main_exposure):
+    """Exposure times of one ladder after main frames of `main_exposure`.
+
+    main/F, main/F^2, ... while longer than the floor, then the floor itself.
+    A step that would give the same camera setting as the shot before it
+    (including the main exposure) is dropped. Empty if the main exposure is
+    already at or below the floor.
+    """
+    if main_exposure <= LADDER_FLOOR:
+        return []
+    times = []
+    t = main_exposure / LADDER_FACTOR
+    while t > LADDER_FLOOR * (1 + 1e-9):
+        times.append(t)
+        t /= LADDER_FACTOR
+    times.append(LADDER_FLOOR)
+
+    out, prev = [], shutter_setting(main_exposure)
+    for t in times:
+        setting = shutter_setting(t)
+        if setting == 'Bulb' or setting != prev:
+            out.append(t)
+        prev = setting
+    return out
+
+
+def shot_plan(main_exposure, repeats):
+    """[(seconds, label)] for the whole run: main frames with ladders between
+    each block of LADDER_EVERY, none after the last main frame."""
+    plan = []
+    steps = ladder(main_exposure)
+    for i in range(1, repeats + 1):
+        plan.append((main_exposure, f'main {i}/{repeats}'))
+        if i % LADDER_EVERY == 0 and i < repeats:
+            plan += [(t, f'ladder {k}/{len(steps)}')
+                     for k, t in enumerate(steps, 1)]
+    return plan
+
+
+def describe(seconds):
+    """How a request is carried out, for printing."""
+    setting = shutter_setting(seconds)
+    if setting == 'Bulb':
+        return f'Bulb {seconds:.3f}s'
+    if abs(nearest_shorter_preset(seconds)[0] - seconds) > 1e-6:
+        return f'{seconds:.4g}s -> preset {setting}'
+    return f'preset {setting}'
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Capture a sequence of exposures on the Nikon Z 6. '
                     'Exposures <= 30 s use the nearest shorter hardware-timed '
-                    'preset; longer exposures use Bulb mode.')
+                    'preset; longer exposures use Bulb mode. After every '
+                    f'{LADDER_EVERY} main frames (except after the last) a '
+                    f'ladder of exposures {LADDER_FACTOR:g}x shorter each, '
+                    f'down to {LADDER_FLOOR:g}s, is shot.')
     parser.add_argument('exposure', type=float,
                         help='Exposure time in seconds (e.g. 20, 30, 120, 180).')
     parser.add_argument('repeats', type=int,
-                        help='Number of shots to take.')
+                        help='Number of main-exposure shots to take (ladder '
+                             'shots come on top).')
     parser.add_argument('download', type=int, choices=(0, 1),
                         help='1 = download each finished image to the current '
                              'folder (kept on the card too); 0 = do not download.')
@@ -52,7 +120,7 @@ def main():
     if args.repeats <= 0:
         parser.error('repeats must be positive')
 
-    use_bulb = args.exposure > MAX_TIMED_SECONDS
+    plan = shot_plan(args.exposure, args.repeats)
 
     err, camera = gp.gp_camera_new()
     assert err == gp.GP_OK, err
@@ -104,26 +172,29 @@ def main():
         set_config('capturetarget', 'Memory card')
         set_config('capturemode', 'Single Shot')
 
-        if use_bulb:
-            set_config('shutterspeed', 'Bulb')
-            print(f"\nBulb mode: {args.exposure:.3f}s per shot, "
-                  f"{args.repeats} shots")
-        else:
-            sec, name = nearest_shorter_preset(args.exposure)
-            if abs(sec - args.exposure) > 1e-6:
-                print(f"Requested {args.exposure:.4f}s -> using nearest shorter "
-                      f"preset {name} ({sec:.4f}s)")
-            set_config('shutterspeed', name)
-            print(f"\nTimed mode: {name} per shot, {args.repeats} shots")
+        steps = ladder(args.exposure)
+        print(f"\nMain exposure: {describe(args.exposure)}, "
+              f"{args.repeats} shots")
+        if steps:
+            print(f"Ladder after every {LADDER_EVERY} main shots: "
+                  + ', '.join(describe(t) for t in steps))
+        n_ladders = (len(plan) - args.repeats) // len(steps) if steps else 0
+        print(f"{len(plan)} shots in total ({n_ladders} ladders)")
 
-        for i in range(args.repeats):
-            print(f"\n--- Shot {i + 1}/{args.repeats} ---")
+        current = None            # 'shutterspeed' now set, to skip re-setting
+        for n, (seconds, label) in enumerate(plan, 1):
+            print(f"\n--- Shot {n}/{len(plan)}: {label}, {describe(seconds)} ---")
             t0 = time.time()
 
-            if use_bulb:
+            setting = shutter_setting(seconds)
+            if setting != current:
+                set_config('shutterspeed', setting)
+                current = setting
+
+            if setting == 'Bulb':
                 # Drive the shutter ourselves: open, hold, close, collect.
                 set_config('bulb', 1)
-                time.sleep(args.exposure)
+                time.sleep(seconds)
                 set_config('bulb', 0)
                 location = drain_until_file()
             else:
