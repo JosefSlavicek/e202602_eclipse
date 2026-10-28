@@ -523,8 +523,19 @@ def _refine_finalize(P, Pc, W, H, M0, t0, cat, cg, Qcat, s_arcsec_px,
                                    math.radians(cen[0]), math.radians(cen[1]))
         return (float(np.degrees(ra_c)) % 360.0, float(np.degrees(dec_c)))
 
-    center = (float(ra0_deg), float(dec0_deg))
-    A, t = M0.copy(), np.asarray(t0, float).copy()
+    # start at the sky position the seed puts the frame centre on, not at the
+    # guess (else a frame far from the guess finds few catalogue stars), and
+    # carry the seed over to that tangent plane: a frame-wide grid goes
+    # pixel -> guess plane -> sky -> new plane, then an affine is refitted
+    guess = (float(ra0_deg), float(dec0_deg))
+    center = recenter(np.asarray(t0, float), guess)
+    gx, gy = np.meshgrid(np.linspace(-W / 2, W / 2, 5), np.linspace(-H / 2, H / 2, 5))
+    G = np.column_stack([gx.ravel(), gy.ravel()])
+    Gq = G @ M0.T + t0
+    g_ra, g_dec = tan_to_radec(np.radians(Gq[:, 0] * s_deg), np.radians(Gq[:, 1] * s_deg),
+                               math.radians(guess[0]), math.radians(guess[1]))
+    g_xi, g_eta = radec_to_tan(g_ra, g_dec, math.radians(center[0]), math.radians(center[1]))
+    A, t = _fit_affine(G, np.column_stack([np.degrees(g_xi), np.degrees(g_eta)]) / s_deg)
     cj = None
     n_in = rms = None
     for it in range(16):
