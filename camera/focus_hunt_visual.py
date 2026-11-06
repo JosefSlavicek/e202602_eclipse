@@ -69,6 +69,19 @@ except Exception as e:  # pragma: no cover - GUI is required for this tool
     print(f"[fatal] tkinter is required for the viewer but is unavailable: {e}")
     sys.exit(1)
 
+try:
+    import simpleaudio as sa
+    _BEEP_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "beep_1000hz_1s.wav")
+    def _beep():
+        try:
+            sa.WaveObject.from_wave_file(_BEEP_WAV).play()
+        except Exception:
+            pass
+except ImportError:
+    def _beep():
+        pass
+
 # ---- tunables -------------------------------------------------------------
 N_IMAGES = 9            # frames per bracket
 CENTRE_INDEX = 4        # 0-based index that lands on current_focus + FIRST_STEP
@@ -246,13 +259,15 @@ class Viewer:
         self.root = tk.Tk()
         self.root.title("Focus bracket viewer")
         self.root.geometry(f"{VIEW_W}x{VIEW_H}")
+        self.root.attributes("-zoomed", True)
 
         bar = tk.Frame(self.root)
         bar.pack(side="top", fill="x")
 
         def btn(parent, text, cmd):
-            b = tk.Button(parent, text=text, command=cmd, takefocus=0)
-            b.pack(side="left", padx=1, pady=2)
+            b = tk.Button(parent, text=text, command=cmd, takefocus=0,
+                          font=("TkDefaultFont", 17), padx=8, pady=6)
+            b.pack(side="left", padx=2, pady=3)
             return b
 
         btn(bar, "◀ Prev (p)", self.prev_image)
@@ -269,7 +284,7 @@ class Viewer:
         btn(bar, "▶", lambda: self.pan(1, 0))
         btn(bar, "Quit (q)", self.root.destroy)
 
-        self.info = tk.Label(self.root, anchor="w", font=("TkFixedFont", 10))
+        self.info = tk.Label(self.root, anchor="w", font=("TkFixedFont", 16))
         self.info.pack(side="top", fill="x")
 
         self.view = tk.Label(self.root, bg="black")
@@ -292,9 +307,9 @@ class Viewer:
             self.pan(0, -1)
         elif k in ("Down", "j"):
             self.pan(0, 1)
-        elif k in ("n", "bracketright", "space", "period"):
+        elif k in ("n", "bracketright", "space", "period", "Next"):
             self.next_image()
-        elif k in ("p", "bracketleft", "comma"):
+        elif k in ("p", "bracketleft", "comma", "Prior"):
             self.prev_image()
         elif k in ("f", "F"):
             self.fit()
@@ -351,12 +366,18 @@ class Viewer:
 
     def next_image(self) -> None:
         # clamp at the last frame (do NOT wrap around to the first)
-        self.idx = min(self.idx + 1, N_IMAGES - 1)  # zoom & pan preserved
+        if self.idx >= N_IMAGES - 1:
+            _beep()
+            return
+        self.idx += 1  # zoom & pan preserved
         self.render()
 
     def prev_image(self) -> None:
         # clamp at the first frame (do NOT wrap around to the last)
-        self.idx = max(self.idx - 1, 0)
+        if self.idx <= 0:
+            _beep()
+            return
+        self.idx -= 1
         self.render()
 
     # -- render ------------------------------------------------------------
@@ -369,10 +390,10 @@ class Viewer:
         zoom = f"{self.num}:1" if self.den == 1 else f"1:{self.den}"
         info = (f"[{self.idx}/{N_IMAGES - 1}]  abs_focus={m['abs_focus']:+d}  "
                 f"offset={m['offset']:+d}  step={self.step}  zoom={zoom}")
-        cv2.putText(frame, info, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, info, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(frame, info, (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.4,
+                    (0, 0, 0), 5, cv2.LINE_AA)
+        cv2.putText(frame, info, (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.4,
+                    (0, 255, 0), 2, cv2.LINE_AA)
 
         self._photo = _to_photo(frame)
         self.view.configure(image=self._photo)

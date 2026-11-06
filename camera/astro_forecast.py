@@ -100,6 +100,7 @@ CHECKS = [
     ("wind", "km/h", 6, "{:.0f}", lambda r: r["wind_speed_10m"], lambda v: v > MAX_WIND),
     ("gust", "km/h", 6, "{:.0f}", lambda r: r["wind_gusts_10m"], lambda v: v > MAX_GUST),
     ("RH", "%", 5, "{:.0f}", lambda r: r["relative_humidity_2m"], lambda v: v > MAX_RH),
+    ("temp", "°C", 5, "{:.0f}", lambda r: r["temperature_2m"], lambda v: False),  # info only
     ("T-Td", "°C", 6, "{:.1f}", _dew_spread, lambda v: v < MIN_DEW_SPREAD),
     ("jet", "m/s", 5, "{:.0f}", _jet, lambda v: v > MAX_JET),
 ]

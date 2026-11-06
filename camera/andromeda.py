@@ -2,6 +2,7 @@ import argparse
 import time
 
 import gphoto2 as gp
+import simpleaudio as sa
 
 # Timed shutter-speed presets exposed by the Nikon Z 6, copied from
 # camera_config_20260426.txt (/main/capturesettings/shutterspeed, choices 0..52).
@@ -210,6 +211,13 @@ def main():
 
     finally:
         gp.gp_camera_exit(camera, context)
+
+    wave_obj = sa.WaveObject.from_wave_file("beep_1000hz_1s.wav")
+    print("Done. Beeping until Ctrl+C...")
+    while True:
+        play_obj = wave_obj.play()
+        play_obj.wait_done()
+        time.sleep(5)
 
 
 if __name__ == '__main__':
