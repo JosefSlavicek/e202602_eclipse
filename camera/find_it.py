@@ -34,13 +34,27 @@ What you must give it for the solve to work:
 System clock accuracy does not matter: M31 is a fixed target and the solve
 comes from the stars, not from time.
 
+--track (for fine pointing once M31 is in or near the frame)
+------------------------------------------------------------
+After the solve, the result is shown for 2 s and then the window turns into a
+black, frame-shaped field with only the arrow.  The camera connection stays
+open and frames are shot one after another (with the same exposure / ISO;
+they are deleted from the card).  Each frame is matched to the FIRST frame
+by star pairs (rotation + shift, so a ball head may roll the camera) and the
+arrow is moved accordingly -- no new plate solve.  The arrow colour flips
+between green and white with every new frame, so you see how fresh it is.
+If the frame cannot be matched (moved too far from the first frame, blurred
+while moving, a doubtful match) a big cross is drawn instead, in the same
+colours, and the loop keeps going.  For a big move, restart the script.
+Close the window or press q to stop.
+
 Run with the python that has gphoto2 + rawpy + numpy + scipy + Pillow
 (the e202602_eclipse env).
 
 Usage
 -----
-    camera/find_it.py [--exposure SEC] [--iso N] [--search-deg D]
-    camera/find_it.py --sim path/to/frame.NEF [--no-gui]
+    camera/find_it.py [--exposure SEC] [--iso N] [--search-deg D] [--track]
+    camera/find_it.py --sim path/to/frame.NEF [--no-gui | --track]
 
     # one-off, online, to (re)build the star catalogue from a HYG csv:
     #   curl -LO https://github.com/astronexus/HYG-Database/raw/main/hyg/CURRENT/hygdata_v41.csv
@@ -89,6 +103,18 @@ MIN_INLIERS = 6      # and this many catalogue matches to accept a solve
 MAX_RMS_PX = 2.0     # and a fit residual below this
 SCALE_TOL = 0.08     # fitted scale must be within +-8% of nominal
 
+# ---- --track tunables -----------------------------------------------------
+TRACK_PAIR_N = 30        # brightest stars per frame used to form pairs
+TRACK_MIN_PAIR_PX = 200  # shorter pairs give too coarse a rotation
+TRACK_LEN_TOL_PX = 3.0   # a reference pair matches a new pair within this length
+TRACK_TOL_PX = 3.0       # a reference star lands on a new star within this
+TRACK_MIN_INLIERS = 8    # fewer matched stars -> no arrow (cross)
+TRACK_MAX_RMS_PX = 1.5   # and a fit residual below this
+TRACK_DISTINCT_PX = 20.0  # fits further apart than this are different answers
+TRACK_AMBIG_FRAC = 0.6   # a different answer scoring this close to the best -> cross
+TRACK_INTRO_S = 2.0      # how long the solve result is shown before the black view
+TRACK_SIM_PERIOD_S = 1.0  # --sim --track: stand-in for the shot time
+
 
 # ==========================================================================
 # capture  (condensed from andromeda.py)
@@ -124,57 +150,101 @@ def capture_one(exposure: float | None, iso: str | None):
     cam = gp.Camera()
     cam.init()
     try:
-        cfg = cam.get_config()
-
-        def _set(name, value):
-            try:
-                node = cfg.get_child_by_name(name)
-            except gp.GPhoto2Error:
-                print(f"[warn] camera has no setting '{name}', skipping")
-                return
-            node.set_value(value)
-            cam.set_config(cfg)
-            print(f"[cam] {name} = {value}")
-
-        _set('capturetarget', 'Memory card')
-        _set('capturemode', 'Single Shot')
-        try:
-            _set('longexpnr', 'Off')
-        except Exception:
-            pass
-        if iso is not None:
-            _set('iso', iso)
-
-        use_bulb = exposure is not None and exposure > MAX_TIMED_S
-        if exposure is not None and not use_bulb:
-            sec, name = _nearest_shorter_preset(exposure)
-            if abs(sec - exposure) > 1e-6:
-                print(f"[cam] requested {exposure:.4f}s -> preset {name}")
-            _set('shutterspeed', name)
-        elif use_bulb:
-            _set('shutterspeed', 'Bulb')
-
+        cfg, use_bulb = _configure_camera(cam, gp, exposure, iso)
         cur = cam.get_single_config('shutterspeed').get_value()
         print(f"[cam] shooting one frame at shutter={cur}")
-
-        if use_bulb:
-            bulb = cfg.get_child_by_name('bulb')
-            bulb.set_value(1)
-            cam.set_config(cfg)
-            time.sleep(exposure)
-            bulb.set_value(0)
-            cam.set_config(cfg)
-            path = _wait_for_file(cam, gp)
-        else:
-            path = cam.capture(gp.GP_CAPTURE_IMAGE)
-
-        folder, name = path.folder, path.name
-        print(f"[cam] captured {folder}/{name}")
-        cf = cam.file_get(folder, name, gp.GP_FILE_TYPE_NORMAL)
-        data = memoryview(cf.get_data_and_size()).tobytes()
+        data, name, _ = _shoot(cam, gp, cfg, exposure, use_bulb)
         return data, name
     finally:
         cam.exit()
+
+
+def _configure_camera(cam, gp, exposure, iso):
+    """Apply capture target / mode / ISO / shutter.  Returns (cfg, use_bulb)."""
+    cfg = cam.get_config()
+
+    def _set(name, value):
+        try:
+            node = cfg.get_child_by_name(name)
+        except gp.GPhoto2Error:
+            print(f"[warn] camera has no setting '{name}', skipping")
+            return
+        node.set_value(value)
+        cam.set_config(cfg)
+        print(f"[cam] {name} = {value}")
+
+    _set('capturetarget', 'Memory card')
+    _set('capturemode', 'Single Shot')
+    try:
+        _set('longexpnr', 'Off')
+    except Exception:
+        pass
+    if iso is not None:
+        _set('iso', iso)
+
+    use_bulb = exposure is not None and exposure > MAX_TIMED_S
+    if exposure is not None and not use_bulb:
+        sec, name = _nearest_shorter_preset(exposure)
+        if abs(sec - exposure) > 1e-6:
+            print(f"[cam] requested {exposure:.4f}s -> preset {name}")
+        _set('shutterspeed', name)
+    elif use_bulb:
+        _set('shutterspeed', 'Bulb')
+    return cfg, use_bulb
+
+
+def _shoot(cam, gp, cfg, exposure, use_bulb):
+    """Shoot one frame on a configured camera.  Returns (raw_bytes, name, folder)."""
+    if use_bulb:
+        bulb = cfg.get_child_by_name('bulb')
+        bulb.set_value(1)
+        cam.set_config(cfg)
+        time.sleep(exposure)
+        bulb.set_value(0)
+        cam.set_config(cfg)
+        path = _wait_for_file(cam, gp)
+    else:
+        path = cam.capture(gp.GP_CAPTURE_IMAGE)
+
+    folder, name = path.folder, path.name
+    print(f"[cam] captured {folder}/{name}")
+    cf = cam.file_get(folder, name, gp.GP_FILE_TYPE_NORMAL)
+    data = memoryview(cf.get_data_and_size()).tobytes()
+    return data, name, folder
+
+
+class TrackCamera:
+    """One camera connection kept open for --track (no reconnect per shot)."""
+
+    def __init__(self, exposure: float | None, iso: str | None):
+        import gphoto2 as gp
+        self.gp, self.exposure = gp, exposure
+        self.cam = gp.Camera()
+        self.cam.init()
+        try:
+            self.cfg, self.use_bulb = _configure_camera(self.cam, gp, exposure, iso)
+            cur = self.cam.get_single_config('shutterspeed').get_value()
+            print(f"[cam] connection kept open, shutter={cur}")
+        except Exception:
+            self.cam.exit()
+            raise
+
+    def shoot(self, keep: bool = True):
+        """Returns (raw_bytes, name); keep=False deletes the file from the card."""
+        data, name, folder = _shoot(self.cam, self.gp, self.cfg, self.exposure,
+                                    self.use_bulb)
+        if not keep:
+            try:
+                self.cam.file_delete(folder, name)
+            except self.gp.GPhoto2Error as e:
+                print(f"[warn] could not delete {folder}/{name} from the card: {e}")
+        return data, name
+
+    def close(self):
+        try:
+            self.cam.exit()
+        except Exception:
+            pass
 
 
 def _wait_for_file(cam, gp, timeout_ms=20000):
@@ -629,12 +699,101 @@ def _clip_to_rect(p0, p1, W, H):
 
 def arrow_endpoints(sol, W, H):
     """(start_xy, end_xy, m31_in_frame). start is always the image centre."""
-    start = (W / 2.0, H / 2.0)
     m31 = radec_to_pixel(sol, M31_RA_DEG, M31_DEC_DEG, W, H)[0]
-    in_frame = (0 <= m31[0] <= W) and (0 <= m31[1] <= H)
+    return arrow_to_point(m31, W, H)
+
+
+def arrow_to_point(p, W, H):
+    """Arrow from the image centre to pixel p, clipped at the frame border."""
+    start = (W / 2.0, H / 2.0)
+    in_frame = (0 <= p[0] <= W) and (0 <= p[1] <= H)
     if in_frame:
-        return start, (float(m31[0]), float(m31[1])), True
-    return start, _clip_to_rect(start, m31, W, H), False
+        return start, (float(p[0]), float(p[1])), True
+    return start, _clip_to_rect(start, p, W, H), False
+
+
+# ==========================================================================
+# --track: rotation + shift of a new frame against the first one
+# ==========================================================================
+def match_rigid(ref_xy, new_xy):
+    """Find the rotation + shift taking reference-frame pixels to new-frame ones.
+
+    A star pair of the new frame and a reference pair of the same length (both
+    orders) give one hypothesis; each is scored by how many reference stars
+    then land on a new star.  The best one is refitted on its matches.  Scale
+    and parity are fixed (same camera and lens), so the fit is rigid.
+    Returns (R 2x2, t 2, n_inliers, rms_px), or None if no fit is trustworthy
+    -- including when a clearly different second fit scores nearly as well.
+    """
+    from scipy.spatial import cKDTree
+
+    if len(ref_xy) < TRACK_MIN_INLIERS or len(new_xy) < TRACK_MIN_INLIERS:
+        return None
+    rb, nb = ref_xy[:TRACK_PAIR_N], new_xy[:TRACK_PAIR_N]
+    ri, rj = np.triu_indices(len(rb), 1)
+    rlen = np.hypot(*(rb[rj] - rb[ri]).T)
+    o = np.argsort(rlen)
+    ri, rj, rlen = ri[o], rj[o], rlen[o]
+    ni, nj = np.triu_indices(len(nb), 1)
+    nlen = np.hypot(*(nb[nj] - nb[ni]).T)
+
+    angs, ts = [], []
+    for a, b, L in zip(ni, nj, nlen):
+        if L < TRACK_MIN_PAIR_PX:
+            continue
+        lo = int(np.searchsorted(rlen, L - TRACK_LEN_TOL_PX))
+        hi = int(np.searchsorted(rlen, L + TRACK_LEN_TOL_PX))
+        dn = nb[b] - nb[a]
+        for k in range(lo, hi):
+            for p, q in ((ri[k], rj[k]), (rj[k], ri[k])):
+                dr = rb[q] - rb[p]
+                ang = math.atan2(dn[1], dn[0]) - math.atan2(dr[1], dr[0])
+                c, s = math.cos(ang), math.sin(ang)
+                angs.append(ang)
+                ts.append(nb[a] - np.array([c * rb[p][0] - s * rb[p][1],
+                                            s * rb[p][0] + c * rb[p][1]]))
+    if not angs:
+        return None
+    angs, ts = np.array(angs), np.array(ts)
+
+    # score every hypothesis at once
+    tree = cKDTree(new_xy)
+    c, s = np.cos(angs), np.sin(angs)
+    px = c[:, None] * ref_xy[:, 0] - s[:, None] * ref_xy[:, 1] + ts[:, :1]
+    py = s[:, None] * ref_xy[:, 0] + c[:, None] * ref_xy[:, 1] + ts[:, 1:]
+    d, _ = tree.query(np.stack([px, py], axis=-1).reshape(-1, 2),
+                      distance_upper_bound=TRACK_TOL_PX)
+    score = np.isfinite(d).reshape(len(angs), -1).sum(axis=1)
+    best = int(score.argmax())
+    if score[best] < TRACK_MIN_INLIERS:
+        return None
+
+    # ambiguity: where does the best fit and every other one put the frame
+    # centre?  A different answer that scores nearly as well -> refuse.
+    ctr = np.array([px.mean(axis=1), py.mean(axis=1)]).T     # same ref points
+    far = np.hypot(*(ctr - ctr[best]).T) > TRACK_DISTINCT_PX
+    if far.any() and score[far].max() >= TRACK_AMBIG_FRAC * score[best]:
+        return None
+
+    # refit on the matches (2-D Kabsch), tightening once
+    R = np.array([[c[best], -s[best]], [s[best], c[best]]])
+    t = ts[best]
+    for _ in range(3):
+        d, j = tree.query(ref_xy @ R.T + t, distance_upper_bound=TRACK_TOL_PX)
+        ok = np.isfinite(d)
+        if ok.sum() < TRACK_MIN_INLIERS:
+            return None
+        src, dst = ref_xy[ok], new_xy[j[ok]]
+        sc, dc = src - src.mean(axis=0), dst - dst.mean(axis=0)
+        Hm = sc.T @ dc
+        ang = math.atan2(Hm[0, 1] - Hm[1, 0], Hm[0, 0] + Hm[1, 1])
+        R = np.array([[math.cos(ang), -math.sin(ang)], [math.sin(ang), math.cos(ang)]])
+        t = dst.mean(axis=0) - R @ src.mean(axis=0)
+    resid = src @ R.T + t - dst
+    rms = float(np.sqrt(np.mean(np.sum(resid ** 2, axis=1))))
+    if rms > TRACK_MAX_RMS_PX:
+        return None
+    return R, t, int(ok.sum()), rms
 
 
 # ==========================================================================
@@ -650,6 +809,13 @@ def _draw_arrow(draw, p0, p1, color, width):
 
 
 def annotate(rgb16, stars, sol, gain, path):
+    im = annotated_image(rgb16, stars, sol, gain)
+    im.save(path)
+    print(f"[out] wrote {path}")
+    return im
+
+
+def annotated_image(rgb16, stars, sol, gain):
     from PIL import Image, ImageDraw
 
     disp = to_display_gray(rgb16, gain)
@@ -684,9 +850,7 @@ def annotate(rgb16, stars, sol, gain, path):
     else:
         msg = sol["reason"] if sol else "not solved"
         dr.text((8, 8), f"NOT SOLVED - no arrow  ({msg})", fill=(255, 120, 120))
-
-    im.save(path)
-    print(f"[out] wrote {path}")
+    return im
 
 
 # ==========================================================================
@@ -874,6 +1038,175 @@ class Viewer:
 
 
 # ==========================================================================
+# --track: live arrow, one new frame after another
+# ==========================================================================
+TRACK_COLORS = ("#00ff00", "#ffffff")   # alternate per frame: shows the update rate
+
+
+class TrackView:
+    """Black frame-shaped field with the arrow to M31 (or a cross when lost).
+
+    The solve result is shown first for TRACK_INTRO_S.  Frame k is drawn in
+    TRACK_COLORS[k % 2], so the colour flips with every new frame.
+    """
+
+    def __init__(self, intro_img, W, H, first_end, results, stop):
+        import tkinter as tk
+        self.W, self.H = W, H
+        self.results, self.stop = results, stop
+        self.intro_img = intro_img
+        self.intro_until = time.time() + TRACK_INTRO_S
+        self._intro_on = True
+        self.idx, self.end = 0, first_end      # end None -> cross
+        self._photo = None
+
+        self.root = tk.Tk()
+        self.root.title("find_it --track")
+        self.root.geometry("1500x1000")
+        self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _e: self.draw())
+        self.root.bind("<Key>", self._key)
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+        self.root.after(100, self._poll)
+
+    def _key(self, e):
+        if e.keysym in ("q", "Escape"):
+            self._quit()
+
+    def _quit(self):
+        self.stop.set()
+        self.root.destroy()
+
+    def _poll(self):
+        import queue
+        changed = False
+        try:
+            while True:
+                self.idx, self.end = self.results.get_nowait()
+                changed = True
+        except queue.Empty:
+            pass
+        if time.time() >= self.intro_until and (changed or self._intro_on):
+            self._intro_on = False
+            self.draw()
+        self.root.after(100, self._poll)
+
+    def _fit(self):
+        cw = max(64, self.canvas.winfo_width())
+        ch = max(64, self.canvas.winfo_height())
+        k = min(cw / self.W, ch / self.H)
+        return k, (cw - k * self.W) / 2.0, (ch - k * self.H) / 2.0
+
+    def draw(self):
+        from PIL import ImageTk
+        cv = self.canvas
+        cv.delete("all")
+        k, ox, oy = self._fit()
+        if self._intro_on:
+            w, h = max(1, int(k * self.W)), max(1, int(k * self.H))
+            self._photo = ImageTk.PhotoImage(self.intro_img.resize((w, h)))
+            cv.create_image(ox, oy, image=self._photo, anchor="nw")
+            return
+        col = TRACK_COLORS[self.idx % 2]
+        x0, y0, x1, y1 = ox, oy, ox + k * self.W, oy + k * self.H
+        cv.create_rectangle(x0, y0, x1, y1, outline="#303030")
+        if self.end is None:
+            cv.create_line(x0, y0, x1, y1, fill=col, width=4)
+            cv.create_line(x0, y1, x1, y0, fill=col, width=4)
+        else:
+            cv.create_line(ox + k * self.W / 2.0, oy + k * self.H / 2.0,
+                           ox + k * self.end[0], oy + k * self.end[1],
+                           fill=col, width=4, arrow="last", arrowshape=(24, 30, 10))
+
+    def run(self):
+        self.root.mainloop()
+
+
+def _track_loop(cam, sim, exposure, iso, ref_xy, m31_ref, W, H, results, stop):
+    """Shoot -> decode -> detect -> match to the first frame -> queue the arrow
+    end (None = lost) until `stop`.  `sim` = (raw, name) re-uses one file."""
+    idx = 1
+    try:
+        while not stop.is_set():
+            t0 = time.time()
+            try:
+                if sim is not None:
+                    time.sleep(TRACK_SIM_PERIOD_S)
+                    raw, name = sim
+                elif cam is None:
+                    raise RuntimeError("camera not connected")
+                else:
+                    raw, name = cam.shoot(keep=False)
+                t1 = time.time()
+                rgb16 = decode_raw(raw, name)
+                stars = detect_stars(rgb16)
+            except Exception as e:
+                print(f"[track] frame {idx}: {e}")
+                results.put((idx, None))
+                idx += 1
+                if sim is None:            # reconnect, once per failure
+                    if cam is not None:
+                        cam.close()
+                    try:
+                        cam = TrackCamera(exposure, iso)
+                    except Exception as e2:
+                        cam = None
+                        print(f"[track] reconnect failed: {e2}")
+                        time.sleep(2.0)
+                continue
+            t2 = time.time()
+            if stop.is_set():
+                break
+            new_xy = np.array([[s["x"], s["y"]] for s in stars], float).reshape(-1, 2)
+            m = match_rigid(ref_xy, new_xy)
+            if m is None:
+                end = None
+                print(f"[track] frame {idx}: LOST ({len(stars)} stars)  "
+                      f"shot {t1 - t0:.1f}s  decode+detect {t2 - t1:.1f}s")
+            else:
+                R, t, n_in, rms = m
+                p = R @ m31_ref + t
+                _, end, inframe = arrow_to_point(p, W, H)
+                print(f"[track] frame {idx}: M31 at ({p[0]:.0f}, {p[1]:.0f})"
+                      f"{'' if inframe else ' (off frame)'}  "
+                      f"rot {math.degrees(math.atan2(R[1, 0], R[0, 0])):+.2f}deg  "
+                      f"{n_in} stars rms {rms:.2f}px  shot {t1 - t0:.1f}s  "
+                      f"decode+detect {t2 - t1:.1f}s  match {time.time() - t2:.2f}s")
+            results.put((idx, end))
+            idx += 1
+    finally:
+        if cam is not None:
+            cam.close()
+
+
+def run_track(cam, sim, args, stars, sol, W, H, intro_img):
+    import queue
+    import threading
+
+    if not sol.get("ok"):
+        print("[track] the first frame did not solve -- nothing to track from")
+        if cam is not None:
+            cam.close()
+        return 1
+    ref_xy = np.array([[s["x"], s["y"]] for s in stars], float)
+    m31_ref = radec_to_pixel(sol, M31_RA_DEG, M31_DEC_DEG, W, H)[0]
+    _, first_end, _ = arrow_endpoints(sol, W, H)
+
+    results, stop = queue.Queue(), threading.Event()
+    th = threading.Thread(target=_track_loop, daemon=True,
+                          args=(cam, sim, args.exposure, args.iso, ref_xy, m31_ref,
+                                W, H, results, stop))
+    view = TrackView(intro_img, W, H, first_end, results, stop)
+    th.start()
+    view.run()
+    stop.set()
+    print("[track] stopping (waiting for the current shot to finish) ...")
+    th.join(timeout=(args.exposure or 0) + 60)
+    return 0
+
+
+# ==========================================================================
 # catalogue builder (one-off, needs the HYG csv)
 # ==========================================================================
 def build_catalog(csv_path: str, out: str = CATALOG_NPZ, mag_max: float = 9.5):
@@ -910,7 +1243,10 @@ def parse_args(argv=None):
     p.add_argument("--iso", default=None, help="ISO to set before the shot")
     p.add_argument("--focal-mm", type=float, default=DEFAULT_FOCAL_MM)
     p.add_argument("--search-deg", type=float, default=8.0,
-                   help="max angle between the frame centre and M31 (default 12)")
+                   help="max angle between the frame centre and M31 (default 8)")
+    p.add_argument("--track", action="store_true",
+                   help="after the solve, keep shooting and update the arrow "
+                        "live (frames matched to the first one; not with --no-gui)")
     p.add_argument("--catalog", default=CATALOG_NPZ)
     p.add_argument("--gain", type=float, default=1.0,
                    help="linear display gain (does not affect detection/solve)")
@@ -929,11 +1265,23 @@ def main(argv=None):
         build_catalog(args.build_catalog, args.catalog)
         return 0
 
+    if args.track and args.no_gui:
+        print("[fatal] --track needs the window; drop --no-gui")
+        return 2
+
+    cam = None
     if args.sim:
         with open(args.sim, "rb") as fh:
             raw = fh.read()
         name = os.path.basename(args.sim)
         print(f"[sim] loaded {name} ({len(raw)} bytes)")
+    elif args.track:
+        cam = TrackCamera(args.exposure, args.iso)
+        try:
+            raw, name = cam.shoot()
+        except Exception:
+            cam.close()
+            raise
     else:
         raw, name = capture_one(args.exposure, args.iso)
 
@@ -962,7 +1310,11 @@ def main(argv=None):
               f"{'M31 at ' if inframe else 'border towards M31, '}"
               f"{tuple(round(v) for v in end)}")
 
-    annotate(rgb16, stars, sol, args.gain, args.out)
+    intro_img = annotate(rgb16, stars, sol, args.gain, args.out)
+
+    if args.track:
+        sim = (raw, name) if args.sim else None
+        return run_track(cam, sim, args, stars, sol, W, H, intro_img)
 
     if not args.no_gui:
         ctx = dict(rgb16=rgb16, stars=stars, sol=sol, cat=cat,
